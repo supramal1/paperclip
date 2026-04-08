@@ -1792,21 +1792,26 @@ export function Inbox() {
                       }
                       desktopMetaLeading={
                         <>
-                          {depth === 0 && hasChildren ? (
-                            <button
-                              type="button"
-                              className="hidden shrink-0 items-center sm:inline-flex"
-                              onClick={(e) => {
-                                e.preventDefault();
-                                e.stopPropagation();
-                                toggleInboxParentCollapse(issue.id);
-                              }}
-                            >
-                              <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
-                            </button>
-                          ) : depth === 0 ? null : (
-                            <span className="hidden w-3.5 shrink-0 sm:block" />
-                          )}
+                          {nestingEnabled ? (
+                            depth === 0 && hasChildren ? (
+                              <button
+                                type="button"
+                                className="hidden w-4 shrink-0 items-center justify-center sm:inline-flex"
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  e.stopPropagation();
+                                  toggleInboxParentCollapse(issue.id);
+                                }}
+                              >
+                                <ChevronRight className={cn("h-3.5 w-3.5 transition-transform", isExpanded && "rotate-90")} />
+                              </button>
+                            ) : (
+                              <span className="hidden w-4 shrink-0 sm:block" />
+                            )
+                          ) : null}
+                          {depth > 0 ? (
+                            <span className="hidden w-4 shrink-0 sm:block" />
+                          ) : null}
                           <InboxIssueMetaLeading
                             issue={iss}
                             isLive={liveIssueIds.has(iss.id)}
@@ -1890,7 +1895,6 @@ export function Inbox() {
                         key={`sel-issue:${child.id}`}
                         data-inbox-item
                         className="relative"
-                        style={{ paddingLeft: 16 }}
                         onClick={() => setSelectedIndex(cNavIdx)}
                       >
                         {canArchiveFromTab ? (
