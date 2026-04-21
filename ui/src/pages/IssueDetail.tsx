@@ -613,19 +613,22 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     () => resolveRunningIssueRun(resolvedActiveRun, resolvedLiveRuns),
     [resolvedActiveRun, resolvedLiveRuns],
   );
+  const liveRunIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const run of resolvedLiveRuns) ids.add(run.id);
+    if (resolvedActiveRun) ids.add(resolvedActiveRun.id);
+    return ids;
+  }, [resolvedActiveRun, resolvedLiveRuns]);
   const timelineRuns = useMemo(() => {
-    const liveIds = new Set<string>();
-    for (const run of resolvedLiveRuns) liveIds.add(run.id);
-    if (activeRun) liveIds.add(activeRun.id);
-    const historicalRuns = liveIds.size === 0
+    const historicalRuns = liveRunIds.size === 0
       ? resolvedLinkedRuns
-      : resolvedLinkedRuns.filter((run) => !liveIds.has(run.runId));
+      : resolvedLinkedRuns.filter((run) => !liveRunIds.has(run.runId));
     return historicalRuns.map((run) => ({
       ...run,
       adapterType: run.adapterType,
       hasStoredOutput: (run.logBytes ?? 0) > 0,
     }));
-  }, [activeRun, resolvedLinkedRuns, resolvedLiveRuns]);
+  }, [liveRunIds, resolvedLinkedRuns]);
   const commentsWithRunMeta = useMemo<IssueDetailComment[]>(() => {
     const activeRunStartedAt = runningIssueRun?.startedAt ?? runningIssueRun?.createdAt ?? null;
     const runMetaByCommentId = new Map<string, { runId: string; runAgentId: string | null; interruptedRunId: string | null }>();
@@ -651,9 +654,10 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
     return comments.map((comment) => {
       const meta = runMetaByCommentId.get(comment.id);
       const nextComment: IssueDetailComment = meta ? { ...comment, ...meta } : { ...comment };
+      const queuedTargetRunId = locallyQueuedCommentRunIds.get(comment.id) ?? null;
       const locallyQueuedComment = applyLocalQueuedIssueCommentState(nextComment, {
-        queuedTargetRunId: locallyQueuedCommentRunIds.get(comment.id) ?? null,
-        hasLiveRuns,
+        queuedTargetRunId,
+        targetRunIsLive: queuedTargetRunId ? liveRunIds.has(queuedTargetRunId) : false,
         runningRunId: runningIssueRun?.id ?? null,
       });
       if (locallyQueuedComment !== nextComment) {
@@ -676,7 +680,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
       }
       return nextComment;
     });
-  }, [comments, hasLiveRuns, locallyQueuedCommentRunIds, resolvedActivity, resolvedLinkedRuns, runningIssueRun]);
+  }, [comments, liveRunIds, locallyQueuedCommentRunIds, resolvedActivity, resolvedLinkedRuns, runningIssueRun]);
   const timelineEvents = useMemo(
     () => extractIssueTimelineEvents(resolvedActivity),
     [resolvedActivity],
@@ -1625,6 +1629,7 @@ export function IssueDetail() {
       const previousLiveRuns = queryClient.getQueryData<LiveRunForIssue[]>(queryKeys.issues.liveRuns(issueId!));
       const previousActiveRun = queryClient.getQueryData<ActiveRunForIssue | null>(queryKeys.issues.activeRun(issueId!));
       const previousIssue = queryClient.getQueryData<Issue>(queryKeys.issues.detail(issueId!));
+      const previousLocalQueuedCommentRunIds = locallyQueuedCommentRunIds;
       const liveRunList = previousLiveRuns ?? [];
       const cachedActiveRun = previousActiveRun ?? null;
       const runningIssueRun = resolveRunningIssueRun(cachedActiveRun, liveRunList);
@@ -1653,12 +1658,17 @@ export function IssueDetail() {
         queryKeys.issues.detail(issueId!),
         (current: Issue | undefined) => clearIssueExecutionRun(current, runId),
       );
+      setLocallyQueuedCommentRunIds((current) => {
+        const next = new Map([...current].filter(([, targetRunId]) => targetRunId !== runId));
+        return next.size === current.size ? current : next;
+      });
 
       return {
         previousRuns,
         previousLiveRuns,
         previousActiveRun,
         previousIssue,
+        previousLocalQueuedCommentRunIds,
       };
     },
     onSuccess: () => {
@@ -1675,6 +1685,9 @@ export function IssueDetail() {
       queryClient.setQueryData(queryKeys.issues.liveRuns(issueId!), context?.previousLiveRuns);
       queryClient.setQueryData(queryKeys.issues.activeRun(issueId!), context?.previousActiveRun);
       queryClient.setQueryData(queryKeys.issues.detail(issueId!), context?.previousIssue);
+      if (context?.previousLocalQueuedCommentRunIds) {
+        setLocallyQueuedCommentRunIds(context.previousLocalQueuedCommentRunIds);
+      }
       pushToast({
         title: "Interrupt failed",
         body: err instanceof Error ? err.message : "Unable to interrupt the active run",
