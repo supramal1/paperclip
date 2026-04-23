@@ -112,6 +112,32 @@ export interface AdapterInvocationMeta {
   context?: Record<string, unknown>;
 }
 
+export interface DelegationRequest {
+  assigneeAgentName: string;
+  title: string;
+  description: string;
+  waitForCompletion: boolean;
+  timeoutSeconds: number;
+}
+
+export type DelegationStatus =
+  | "queued"
+  | "completed"
+  | "failed"
+  | "timeout"
+  | "rejected";
+
+export interface DelegationResult {
+  status: DelegationStatus;
+  childRunId: string | null;
+  childIssueId: string | null;
+  childIssueIdentifier: string | null;
+  finalText: string | null;
+  costUsd: number | null;
+  errorCode: string | null;
+  errorMessage: string | null;
+}
+
 export interface AdapterExecutionContext {
   runId: string;
   agent: AdapterAgent;
@@ -122,6 +148,13 @@ export interface AdapterExecutionContext {
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
+  /**
+   * When present, the adapter may expose a `delegate_task` tool to the agent.
+   * Server binds this callback only for agents with reportsTo children and
+   * `permissions.canDelegate === true`. Adapters that don't support custom
+   * tool surfaces can ignore it.
+   */
+  delegateTask?: (req: DelegationRequest) => Promise<DelegationResult>;
 }
 
 export interface AdapterModel {

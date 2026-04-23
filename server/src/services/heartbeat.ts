@@ -41,6 +41,7 @@ import type { AdapterExecutionResult, AdapterInvocationMeta, AdapterSessionCodec
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { canAgentDelegate, createDelegateTaskCallback } from "./delegation.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -755,6 +756,12 @@ interface WakeupOptions {
   requestedByActorType?: "user" | "agent" | "system";
   requestedByActorId?: string | null;
   contextSnapshot?: Record<string, unknown>;
+  /**
+   * Parent heartbeat_run that delegated this wakeup (delegate_task). Stored on
+   * the child run's `parent_run_id` column so cost/usage queries can roll up
+   * descendant costs to the delegator.
+   */
+  parentRunId?: string | null;
 }
 
 type UsageTotals = {
@@ -5459,6 +5466,27 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      const agentPermissions = parseObject(
+        (agent as { permissions?: unknown }).permissions ?? null,
+      );
+      const delegationAllowed = await canAgentDelegate(db, {
+        id: agent.id,
+        companyId: agent.companyId,
+        permissions: agentPermissions,
+      });
+      const delegateTask = delegationAllowed
+        ? createDelegateTaskCallback({
+            db,
+            heartbeat: { wakeup: enqueueWakeup },
+            parentAgent: {
+              id: agent.id,
+              companyId: agent.companyId,
+              name: agent.name,
+              permissions: agentPermissions,
+            },
+            parentRunId: run.id,
+          })
+        : undefined;
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -5478,6 +5506,7 @@ export function heartbeatService(db: Db) {
           });
         },
         authToken: authToken ?? undefined,
+        delegateTask,
       });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
@@ -6765,6 +6794,7 @@ export function heartbeatService(db: Db) {
         contextSnapshot: enrichedContextSnapshot,
         sessionIdBefore: sessionBefore,
         continuationAttempt,
+        parentRunId: opts.parentRunId ?? null,
       })
       .returning()
       .then((rows) => rows[0]);

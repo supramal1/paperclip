@@ -79,15 +79,38 @@ export interface MaEvent {
   [k: string]: unknown;
 }
 
+export interface MaCustomToolSpec {
+  name: string;
+  description: string;
+  input_schema: Json;
+}
+
 export async function createAgent(
   apiKey: string,
-  input: { name: string; model: string; system: string; skills?: string[] },
+  input: {
+    name: string;
+    model: string;
+    system: string;
+    skills?: string[];
+    customTools?: MaCustomToolSpec[];
+  },
 ): Promise<MaAgent> {
+  const tools: Json[] = [{ type: "agent_toolset_20260401" }];
+  if (input.customTools && input.customTools.length > 0) {
+    for (const spec of input.customTools) {
+      tools.push({
+        type: "custom",
+        name: spec.name,
+        description: spec.description,
+        input_schema: spec.input_schema,
+      });
+    }
+  }
   const body: Json = {
     name: input.name,
     model: input.model,
     system: input.system,
-    tools: [{ type: "agent_toolset_20260401" }],
+    tools,
   };
   return maCall<MaAgent>(apiKey, "POST", "/agents", body);
 }
@@ -120,6 +143,25 @@ export async function postUserMessage(
 ): Promise<{ data: MaEvent[] }> {
   return maCall<{ data: MaEvent[] }>(apiKey, "POST", `/sessions/${sessionId}/events`, {
     events: [{ type: "user.message", content: [{ type: "text", text }] }],
+  });
+}
+
+export async function postCustomToolResult(
+  apiKey: string,
+  sessionId: string,
+  toolUseId: string,
+  resultText: string,
+  isError = false,
+): Promise<{ data: MaEvent[] }> {
+  return maCall<{ data: MaEvent[] }>(apiKey, "POST", `/sessions/${sessionId}/events`, {
+    events: [
+      {
+        type: "user.custom_tool_result",
+        tool_use_id: toolUseId,
+        is_error: isError,
+        content: [{ type: "text", text: resultText }],
+      },
+    ],
   });
 }
 

@@ -1,6 +1,7 @@
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
+  DelegationRequest,
 } from "@paperclipai/adapter-utils";
 import {
   createAgent,
@@ -9,10 +10,12 @@ import {
   getSession,
   listEvents,
   postUserMessage,
+  postCustomToolResult,
   fetchCornerstoneContext,
   cookbookGetSkill,
   cookbookListSkills,
   type MaEvent,
+  type MaCustomToolSpec,
   type CookbookSkillDetail,
 } from "./client.js";
 import { renderSystemPrompt, renderUserTurn } from "./prompt.js";
@@ -125,30 +128,117 @@ async function fetchSkillBodies(
 // Wait for session to return to idle after posting a user.message.
 // Polls GET /v1/sessions/{id}/events every 500ms up to timeoutMs.
 // Streams new events to ctx.onLog as they appear.
+// When a custom tool use is detected and a handler is provided, the tool is
+// dispatched inline and its result is posted back to the session so the loop
+// can continue past the next idle. Events already seen by an earlier cycle
+// (e.g. a `session.status_idle` raised before the tool result was posted) are
+// ignored via `seenIds` so they don't falsely terminate the outer loop.
+type CustomToolHandler = (ev: MaEvent) => Promise<void>;
+
 async function waitForIdle(
   apiKey: string,
   sessionId: string,
   seenIds: Set<string>,
   onEvent: (ev: MaEvent) => Promise<void>,
   timeoutMs: number,
+  onCustomTool?: CustomToolHandler,
 ): Promise<MaEvent[]> {
   const start = Date.now();
   const allNew: MaEvent[] = [];
   while (Date.now() - start < timeoutMs) {
     const { data } = await listEvents(apiKey, sessionId);
+    let pendingCustomTool = false;
+    let sawTerminalThisCycle = false;
     for (const ev of data) {
       if (seenIds.has(ev.id)) continue;
       seenIds.add(ev.id);
       allNew.push(ev);
       await onEvent(ev);
+      if (ev.type === "agent.custom_tool_use" && onCustomTool) {
+        await onCustomTool(ev);
+        pendingCustomTool = true;
+      }
+      if (
+        ev.type === "session.status_idle" ||
+        ev.type === "session.status_terminated"
+      ) {
+        sawTerminalThisCycle = true;
+      }
     }
-    const terminal = data.find(
-      (e) => e.type === "session.status_idle" || e.type === "session.status_terminated",
-    );
-    if (terminal) return allNew;
+    if (sawTerminalThisCycle && !pendingCustomTool) return allNew;
     await new Promise((r) => setTimeout(r, 500));
   }
   throw new Error(`Session ${sessionId} did not reach idle within ${timeoutMs}ms`);
+}
+
+const DELEGATE_TASK_TOOL_NAME = "delegate_task";
+
+function buildDelegateTaskToolSpec(): MaCustomToolSpec {
+  return {
+    name: DELEGATE_TASK_TOOL_NAME,
+    description:
+      "Delegate a unit of work to one of your direct reports. Creates an issue assigned to the named agent and (if wait=true) blocks until the child run finishes, returning its final output. Only direct reports can be assignees. Nested delegation requires the assignee to have canDelegate permission.",
+    input_schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        assignee_agent_name: {
+          type: "string",
+          description: "Name of a direct-report agent (case-insensitive).",
+        },
+        title: {
+          type: "string",
+          description: "Short issue title for the delegated task (< 160 chars).",
+        },
+        description: {
+          type: "string",
+          description: "Full task description / prompt body for the assignee.",
+        },
+        wait: {
+          type: "boolean",
+          description: "If true (default), block until the child run completes or times out.",
+          default: true,
+        },
+        timeout_seconds: {
+          type: "integer",
+          description: "Upper bound in seconds before returning status=timeout. Default 3600.",
+          default: 3600,
+          minimum: 60,
+          maximum: 14400,
+        },
+      },
+      required: ["assignee_agent_name", "title", "description"],
+    },
+  };
+}
+
+function parseDelegateTaskInput(raw: unknown): DelegationRequest | { error: string } {
+  if (!raw || typeof raw !== "object") return { error: "input must be an object" };
+  const rec = raw as Record<string, unknown>;
+  const assignee = rec.assignee_agent_name;
+  const title = rec.title;
+  const description = rec.description;
+  if (typeof assignee !== "string" || assignee.trim().length === 0) {
+    return { error: "assignee_agent_name is required" };
+  }
+  if (typeof title !== "string" || title.trim().length === 0) {
+    return { error: "title is required" };
+  }
+  if (typeof description !== "string" || description.trim().length === 0) {
+    return { error: "description is required" };
+  }
+  const wait = typeof rec.wait === "boolean" ? rec.wait : true;
+  const timeout =
+    typeof rec.timeout_seconds === "number" && rec.timeout_seconds > 0
+      ? Math.floor(rec.timeout_seconds)
+      : 3600;
+  return {
+    assigneeAgentName: assignee.trim(),
+    title: title.trim().slice(0, 200),
+    description,
+    waitForCompletion: wait,
+    timeoutSeconds: Math.min(Math.max(timeout, 60), 14400),
+  };
 }
 
 export async function execute(
@@ -247,10 +337,14 @@ export async function execute(
     agentId
       ? Promise.resolve({ id: agentId, version: agentVersion ?? 1 })
       : (async () => {
+          const customTools = ctx.delegateTask
+            ? [buildDelegateTaskToolSpec()]
+            : undefined;
           const a = await createAgent(apiKey, {
             name: `paperclip-${ctx.agent.companyId.slice(0, 8)}-${ctx.agent.id.slice(0, 8)}`,
             model,
             system: "bootstrap",
+            customTools,
           });
           return { id: a.id, version: a.version };
         })(),
@@ -325,7 +419,65 @@ export async function execute(
     await ctx.onLog("stdout", JSON.stringify({ managed_agents_event: ev.type, id: ev.id, ...(ev.content ? { content: ev.content } : {}), ...(ev.model_usage ? { model_usage: ev.model_usage } : {}) }) + "\n");
   };
 
-  const newEvents = await waitForIdle(apiKey, sessionId, seen, onEvent, timeoutSec * 1000);
+  const delegateTask = ctx.delegateTask;
+  const onCustomTool: CustomToolHandler | undefined = delegateTask
+    ? async (ev: MaEvent) => {
+        const toolUseId = typeof ev.tool_use_id === "string" ? ev.tool_use_id : null;
+        const name = typeof ev.name === "string" ? ev.name : null;
+        if (!toolUseId || !name) return;
+        if (name !== DELEGATE_TASK_TOOL_NAME) {
+          await postCustomToolResult(
+            apiKey,
+            sessionId,
+            toolUseId,
+            JSON.stringify({ error: `unknown tool: ${name}` }),
+            true,
+          );
+          return;
+        }
+        const parsed = parseDelegateTaskInput(ev.input);
+        if ("error" in parsed) {
+          await postCustomToolResult(
+            apiKey,
+            sessionId,
+            toolUseId,
+            JSON.stringify({ error: parsed.error }),
+            true,
+          );
+          return;
+        }
+        try {
+          const result = await delegateTask(parsed);
+          await postCustomToolResult(
+            apiKey,
+            sessionId,
+            toolUseId,
+            JSON.stringify(result),
+            result.status === "failed" ||
+              result.status === "rejected" ||
+              result.status === "timeout",
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await postCustomToolResult(
+            apiKey,
+            sessionId,
+            toolUseId,
+            JSON.stringify({ error: msg, status: "failed" }),
+            true,
+          );
+        }
+      }
+    : undefined;
+
+  const newEvents = await waitForIdle(
+    apiKey,
+    sessionId,
+    seen,
+    onEvent,
+    timeoutSec * 1000,
+    onCustomTool,
+  );
 
   // Aggregate usage + final response
   let inputTokens = 0;
