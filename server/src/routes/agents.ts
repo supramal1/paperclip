@@ -2326,6 +2326,9 @@ export function agentRoutes(db: Db) {
         triggeredBy: req.actor.type,
         actorId: req.actor.type === "agent" ? req.actor.agentId : req.actor.userId,
         forceFreshSession: req.body.forceFreshSession === true,
+        ...(typeof req.body.payload?.taskBody === "string" ? { taskBody: req.body.payload.taskBody } : {}),
+        ...(typeof req.body.payload?.body === "string" ? { body: req.body.payload.body } : {}),
+        ...(typeof req.body.payload?.prompt === "string" ? { prompt: req.body.payload.prompt } : {}),
       },
     });
 

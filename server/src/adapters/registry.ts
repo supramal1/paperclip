@@ -36,6 +36,18 @@ import {
 } from "@paperclipai/adapter-gemini-local/server";
 import { agentConfigurationDoc as geminiAgentConfigurationDoc, models as geminiModels } from "@paperclipai/adapter-gemini-local";
 import {
+  execute as managedAgentsExecute,
+  testEnvironment as managedAgentsTestEnvironment,
+  sessionCodec as managedAgentsSessionCodec,
+  onHireApproved as managedAgentsOnHireApproved,
+  listSkills as managedAgentsListSkills,
+  syncSkills as managedAgentsSyncSkills,
+} from "@paperclipai/adapter-managed-agents/server";
+import {
+  agentConfigurationDoc as managedAgentsAgentConfigurationDoc,
+  models as managedAgentsModels,
+} from "@paperclipai/adapter-managed-agents";
+import {
   execute as openCodeExecute,
   listOpenCodeSkills,
   syncOpenCodeSkills,
@@ -186,6 +198,22 @@ const geminiLocalAdapter: ServerAdapterModule = {
   agentConfigurationDoc: geminiAgentConfigurationDoc,
 };
 
+const managedAgentsAdapter: ServerAdapterModule = {
+  type: "managed_agents",
+  execute: managedAgentsExecute,
+  testEnvironment: managedAgentsTestEnvironment,
+  sessionCodec: managedAgentsSessionCodec,
+  onHireApproved: managedAgentsOnHireApproved,
+  listSkills: managedAgentsListSkills,
+  syncSkills: managedAgentsSyncSkills,
+  sessionManagement: getAdapterSessionManagement("managed_agents") ?? undefined,
+  models: managedAgentsModels,
+  supportsLocalAgentJwt: false,
+  supportsInstructionsBundle: false,
+  requiresMaterializedRuntimeSkills: false,
+  agentConfigurationDoc: managedAgentsAgentConfigurationDoc,
+};
+
 const openclawGatewayAdapter: ServerAdapterModule = {
   type: "openclaw_gateway",
   execute: openclawGatewayExecute,
@@ -316,6 +344,7 @@ function registerBuiltInAdapters() {
     piLocalAdapter,
     cursorLocalAdapter,
     geminiLocalAdapter,
+    managedAgentsAdapter,
     openclawGatewayAdapter,
     hermesLocalAdapter,
     processAdapter,
