@@ -23,6 +23,33 @@ import { renderSystemPrompt, renderUserTurn } from "./prompt.js";
 import { calcRuntimeCostUsd, calcTokenCostUsd } from "./cost.js";
 import { cacheGet, cachePut } from "./cache.js";
 
+// Structured stdout logger. Single-line JSON so Cloud Run's logging agent
+// promotes `severity` and other fields into the log entry. Intentionally
+// bypasses ctx.onLog because ctx.onLog writes to the per-run local_file log
+// store (ephemeral — gone when the container scales down). console.log hits
+// Cloud Run stdout which Cloud Logging captures durably. Added 2026-04-24
+// after Ada's synthesis failure (run 5fc47c80) could not be diagnosed because
+// every adapter-level event was trapped in a local_file log we couldn't read.
+function maDbg(
+  event: string,
+  fields: Record<string, unknown> = {},
+  severity: "DEBUG" | "INFO" | "WARNING" | "ERROR" = "INFO",
+): void {
+  try {
+    console.log(
+      JSON.stringify({
+        severity,
+        adapter: "managed_agents",
+        event,
+        ts: new Date().toISOString(),
+        ...fields,
+      }),
+    );
+  } catch {
+    // Never let a logging failure break the adapter.
+  }
+}
+
 function readString(v: unknown): string | null {
   return typeof v === "string" && v.trim().length > 0 ? v.trim() : null;
 }
@@ -146,14 +173,63 @@ async function waitForIdle(
 ): Promise<MaEvent[]> {
   const start = Date.now();
   const allNew: MaEvent[] = [];
+  let iter = 0;
+  maDbg("waitForIdle_start", { sessionId, timeoutMs, seenIdsAtEntry: seenIds.size });
   while (Date.now() - start < timeoutMs) {
+    iter += 1;
+    const cycleStart = Date.now();
     const { data } = await listEvents(apiKey, sessionId);
+    const beforeSeen = seenIds.size;
     let pendingCustomTool = false;
     let sawTerminalThisCycle = false;
+    let sawStatusIdle = false;
+    let sawStatusTerminated = false;
+    let lastIdleStopReason: string | null = null;
     for (const ev of data) {
       if (seenIds.has(ev.id)) continue;
       seenIds.add(ev.id);
       allNew.push(ev);
+      // Log every MA session state transition directly to Cloud Run stdout so
+      // H1-class failures (session terminated before we post a tool_result)
+      // are visible in logs. The ctx.onLog callback separately captures events
+      // in the heartbeat_run's log_store, but that's local_file and ephemeral.
+      if (ev.type === "session.status_idle") {
+        sawStatusIdle = true;
+        lastIdleStopReason = ev.stop_reason?.type ?? null;
+        maDbg("ma_session_idle", {
+          sessionId,
+          evId: ev.id,
+          stopReason: lastIdleStopReason,
+          iter,
+        });
+      } else if (ev.type === "session.status_terminated") {
+        sawStatusTerminated = true;
+        maDbg(
+          "ma_session_terminated",
+          {
+            sessionId,
+            evId: ev.id,
+            iter,
+            processedAt: ev.processed_at ?? null,
+            rawFields: Object.keys(ev),
+          },
+          "WARNING",
+        );
+      } else if (ev.type === "agent.stop") {
+        maDbg("ma_agent_stop", {
+          sessionId,
+          evId: ev.id,
+          iter,
+          rawFields: Object.keys(ev),
+        });
+      } else if (ev.type === "agent.custom_tool_use") {
+        maDbg("ma_custom_tool_use", {
+          sessionId,
+          evId: ev.id,
+          iter,
+          toolName: typeof ev.name === "string" ? ev.name : null,
+        });
+      }
       await onEvent(ev);
       if (ev.type === "agent.custom_tool_use" && onCustomTool) {
         await onCustomTool(ev);
@@ -166,9 +242,43 @@ async function waitForIdle(
         sawTerminalThisCycle = true;
       }
     }
-    if (sawTerminalThisCycle && !pendingCustomTool) return allNew;
+    const newThisCycle = seenIds.size - beforeSeen;
+    maDbg("waitForIdle_iter", {
+      sessionId,
+      iter,
+      eventsReturned: data.length,
+      newThisCycle,
+      sawStatusIdle,
+      sawStatusTerminated,
+      lastIdleStopReason,
+      pendingCustomTool,
+      sawTerminalThisCycle,
+      cycleMs: Date.now() - cycleStart,
+      elapsedMs: Date.now() - start,
+    });
+    if (sawTerminalThisCycle && !pendingCustomTool) {
+      maDbg("waitForIdle_return", {
+        sessionId,
+        reason: "terminal_no_pending_tool",
+        iter,
+        totalNewEvents: allNew.length,
+        elapsedMs: Date.now() - start,
+      });
+      return allNew;
+    }
     await new Promise((r) => setTimeout(r, 500));
   }
+  maDbg(
+    "waitForIdle_timeout",
+    {
+      sessionId,
+      iter,
+      totalNewEvents: allNew.length,
+      elapsedMs: Date.now() - start,
+      timeoutMs,
+    },
+    "ERROR",
+  );
   throw new Error(`Session ${sessionId} did not reach idle within ${timeoutMs}ms`);
 }
 
@@ -401,6 +511,16 @@ export async function execute(
     agentVersion,
   });
   sessionId = session.id;
+  maDbg("session_created", {
+    sessionId,
+    agentId,
+    environmentId,
+    agentVersion,
+    companyId: ctx.agent.companyId,
+    paperclipAgentId: ctx.agent.id,
+    hasDelegateTask: Boolean(ctx.delegateTask),
+    timeoutSec,
+  });
 
   await ctx.onSpawn?.({
     pid: 0, // remote session — no local pid
@@ -423,6 +543,58 @@ export async function execute(
   };
 
   const delegateTask = ctx.delegateTask;
+  // Wrapper around postCustomToolResult that emits structured stdout logs
+  // before/after the HTTP call. Used instead of calling postCustomToolResult
+  // directly so every post is traceable in Cloud Logging with the tool_use_id,
+  // context tag, timing, and response event count. On failure we log the HTTP
+  // error before rethrowing so the tool handler's outer try/catch still runs.
+  const postToolResultLogged = async (
+    toolUseId: string,
+    resultText: string,
+    isError: boolean,
+    context: string,
+  ): Promise<{ data: MaEvent[] } | null> => {
+    const t0 = Date.now();
+    maDbg("post_tool_result_start", {
+      sessionId,
+      toolUseId,
+      isError,
+      context,
+      resultLen: resultText.length,
+    });
+    try {
+      const res = await postCustomToolResult(
+        apiKey,
+        sessionId,
+        toolUseId,
+        resultText,
+        isError,
+      );
+      maDbg("post_tool_result_ok", {
+        sessionId,
+        toolUseId,
+        context,
+        durationMs: Date.now() - t0,
+        responseEventCount: Array.isArray(res.data) ? res.data.length : 0,
+      });
+      return res;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      maDbg(
+        "post_tool_result_error",
+        {
+          sessionId,
+          toolUseId,
+          context,
+          durationMs: Date.now() - t0,
+          error: msg,
+        },
+        "ERROR",
+      );
+      throw err;
+    }
+  };
+
   const onCustomTool: CustomToolHandler | undefined = delegateTask
     ? async (ev: MaEvent) => {
         // On agent.custom_tool_use, the event's own `id` is the tool_use_id
@@ -460,45 +632,54 @@ export async function execute(
         );
         if (!toolUseId || !name) return;
         if (name !== DELEGATE_TASK_TOOL_NAME) {
-          await postCustomToolResult(
-            apiKey,
-            sessionId,
+          await postToolResultLogged(
             toolUseId,
             JSON.stringify({ error: `unknown tool: ${name}` }),
             true,
+            "unknown_tool",
           );
           return;
         }
         const parsed = parseDelegateTaskInput(input);
         if ("error" in parsed) {
-          await postCustomToolResult(
-            apiKey,
-            sessionId,
+          await postToolResultLogged(
             toolUseId,
             JSON.stringify({ error: parsed.error }),
             true,
+            "parse_error",
           );
           return;
         }
         try {
           const result = await delegateTask(parsed);
-          await postCustomToolResult(
-            apiKey,
+          maDbg("delegate_task_result", {
             sessionId,
+            toolUseId,
+            status: result.status,
+            childRunId: result.childRunId ?? null,
+            childIssueId: result.childIssueId ?? null,
+            errorCode: result.errorCode ?? null,
+          });
+          await postToolResultLogged(
             toolUseId,
             JSON.stringify(result),
             result.status === "failed" ||
               result.status === "rejected" ||
               result.status === "timeout",
+            "delegate_task_result",
           );
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
-          await postCustomToolResult(
-            apiKey,
-            sessionId,
+          maDbg(
+            "delegate_task_threw",
+            { sessionId, toolUseId, error: msg },
+            "ERROR",
+          );
+          await postToolResultLogged(
             toolUseId,
             JSON.stringify({ error: msg, status: "failed" }),
             true,
+            "delegate_task_exception",
           );
         }
       }
@@ -521,6 +702,8 @@ export async function execute(
   let finalText = "";
   let isError = false;
   let stopReason: string | null = null;
+  let spanCount = 0;
+  let customToolUseCount = 0;
 
   for (const ev of newEvents) {
     if (ev.type === "span.model_request_end" && ev.model_usage) {
@@ -529,6 +712,10 @@ export async function execute(
       cacheReadTokens += ev.model_usage.cache_read_input_tokens;
       cacheCreateTokens += ev.model_usage.cache_creation_input_tokens;
       if (ev.is_error) isError = true;
+      spanCount += 1;
+    }
+    if (ev.type === "agent.custom_tool_use") {
+      customToolUseCount += 1;
     }
     if (ev.type === "agent.message" && ev.content) {
       const text = ev.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
@@ -542,6 +729,80 @@ export async function execute(
   // Pull final session state for runtime cost
   const finalSession = await getSession(apiKey, sessionId);
   const activeSeconds = finalSession.stats?.active_seconds ?? 0;
+
+  // -------------------------------------------------------------------------
+  // H1 detector — "session terminated before tool_result"
+  //
+  // Invariant: every agent.custom_tool_use event should be followed by a
+  // subsequent span.model_request_end (the synthesis turn where the model
+  // reads the posted tool_result and produces its next output). So the total
+  // span count must be >= customToolUseCount + 1 (one span emitted the tool_use
+  // itself, plus one synthesis span per tool_result).
+  //
+  // When spans < customToolUseCount + 1, MA emitted the tool_use but never
+  // ran the synthesis turn. We observed this in Ada's run 5fc47c80 on
+  // 2026-04-24: cacheReadTokens=0 at run-end proved no second API call
+  // happened. finalText stayed at her pre-delegation preamble. Prior to this
+  // check, the adapter classified such runs as success (exitCode=0) because
+  // no explicit API error fired — hiding the failure from every downstream
+  // system.
+  //
+  // Classify as error so: (a) heartbeat_run is marked failed, (b) the
+  // reconciler can retry with backoff instead of silently stalling, (c)
+  // errorMeta lands the diagnostic fields as structured JSON in Cloud
+  // Logging so operators can filter by errorCode without string-parsing.
+  //
+  // Run-end placement (not per-waitForIdle-iteration) — H1 can manifest at
+  // the loop exit or after the final status check, so operating against the
+  // aggregated event stream handles both in-flight and post-hoc termination.
+  // -------------------------------------------------------------------------
+  const expectedMinSpans = customToolUseCount + 1;
+  const h1Detected = customToolUseCount > 0 && spanCount < expectedMinSpans;
+  let h1ErrorCode: string | null = null;
+  let h1ErrorMessage: string | null = null;
+  let h1ErrorMeta: Record<string, unknown> | null = null;
+  if (h1Detected) {
+    isError = true;
+    h1ErrorCode = "session_terminated_before_tool_result";
+    h1ErrorMessage =
+      `MA session did not resume after ${customToolUseCount} tool_result post(s). ` +
+      `Observed ${spanCount} model span(s), expected ≥ ${expectedMinSpans}.`;
+    h1ErrorMeta = {
+      sessionId,
+      runId: ctx.runId,
+      companyId: ctx.agent.companyId,
+      paperclipAgentId: ctx.agent.id,
+      customToolUseCount,
+      spanCount,
+      expectedMinSpans,
+      cacheReadTokens,
+      maSessionStatus: finalSession.status,
+      stopReason,
+    };
+  }
+
+  maDbg(
+    "session_completed",
+    {
+      sessionId,
+      companyId: ctx.agent.companyId,
+      paperclipAgentId: ctx.agent.id,
+      activeSeconds,
+      stopReason,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreateTokens,
+      finalTextLen: finalText.length,
+      newEventCount: newEvents.length,
+      spanCount,
+      customToolUseCount,
+      h1Detected,
+      isError,
+      maSessionStatus: finalSession.status,
+    },
+    h1Detected ? "ERROR" : "INFO",
+  );
   const tokenCost = calcTokenCostUsd(model, {
     inputTokens,
     outputTokens,
@@ -555,6 +816,9 @@ export async function execute(
     exitCode: isError ? 1 : 0,
     signal: null,
     timedOut: false,
+    errorCode: h1ErrorCode,
+    errorMessage: h1ErrorMessage,
+    ...(h1ErrorMeta ? { errorMeta: h1ErrorMeta } : {}),
     usage: {
       inputTokens,
       outputTokens,
@@ -581,6 +845,9 @@ export async function execute(
       cacheReadTokens,
       cacheCreateTokens,
       finalText,
+      spanCount,
+      customToolUseCount,
+      h1Detected,
     },
     summary: finalText.slice(0, 280) || null,
   };

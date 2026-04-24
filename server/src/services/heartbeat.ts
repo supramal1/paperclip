@@ -6549,11 +6549,16 @@ export function heartbeatService(db: Db) {
               activeExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
             );
+            const shouldSetParentRunId =
+              !activeExecutionRun.parentRunId &&
+              typeof opts.parentRunId === "string" &&
+              opts.parentRunId.length > 0;
             const mergedRun = await tx
               .update(heartbeatRuns)
               .set({
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
+                ...(shouldSetParentRunId ? { parentRunId: opts.parentRunId } : {}),
               })
               .where(eq(heartbeatRuns.id, activeExecutionRun.id))
               .returning()
@@ -6670,6 +6675,7 @@ export function heartbeatService(db: Db) {
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
             continuationAttempt,
+            parentRunId: opts.parentRunId ?? null,
           })
           .returning()
           .then((rows) => rows[0]);
