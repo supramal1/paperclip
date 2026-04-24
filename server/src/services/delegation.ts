@@ -3,21 +3,23 @@ import type {
   DelegationRequest,
   DelegationResult,
 } from "@paperclipai/adapter-utils";
-import { agents, costEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import {
+  agents,
+  costEvents,
+  heartbeatRuns,
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
+  type Db,
+} from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 
-/**
- * Terminal statuses for a child heartbeat_run. The delegation poller returns
- * once the child row lands on one of these.
- */
-const TERMINAL_STATUSES = new Set([
-  "done",
-  "failed",
-  "canceled",
-  "cancelled",
-  "error",
-]);
+// Canonical terminal set for heartbeat_runs.status. Imported from the schema
+// module so this poller can never drift from the statuses the runtime actually
+// writes. (Prior to this import we checked for "done" — which the runtime
+// never writes — so succeeded child runs were never detected and the parent's
+// delegate_task tool_result was never posted.)
+const TERMINAL_STATUSES = new Set<string>(HEARTBEAT_RUN_TERMINAL_STATUSES);
+const SUCCEEDED_STATUS = "succeeded";
 
 interface DelegationDeps {
   db: Db;
@@ -231,6 +233,17 @@ export function createDelegateTaskCallback(
     }
 
     if (!childRow || !TERMINAL_STATUSES.has(childRow.status)) {
+      // Child never reached terminal. Flip the issue to cancelled so the
+      // reconciler doesn't keep waking the assignee forever on a task its
+      // parent already gave up on.
+      try {
+        await svc.update(issue.id, { status: "cancelled" });
+      } catch (err) {
+        logger.warn(
+          { err: err instanceof Error ? err.message : String(err), issueId: issue.id },
+          "delegation: failed to cancel issue after child timeout",
+        );
+      }
       return {
         ...baseResult,
         status: "timeout",
@@ -248,17 +261,36 @@ export function createDelegateTaskCallback(
           ? resultJson.summary
           : null;
 
-    const failed = childRow.status !== "done";
+    const succeeded = childRow.status === SUCCEEDED_STATUS;
+
+    // Flip the child issue out of in_progress so the heartbeat reconciler
+    // stops re-waking the assignee via issue.continuation_recovery. Succeeded
+    // → done; anything else (failed / cancelled / timed_out) → cancelled so
+    // the parent owns reassignment via the tool_result it's about to receive.
+    const nextIssueStatus = succeeded ? "done" : "cancelled";
+    try {
+      await svc.update(issue.id, { status: nextIssueStatus });
+    } catch (err) {
+      logger.warn(
+        {
+          err: err instanceof Error ? err.message : String(err),
+          issueId: issue.id,
+          childStatus: childRow.status,
+          nextIssueStatus,
+        },
+        "delegation: failed to update issue status after child terminal",
+      );
+    }
 
     return {
-      status: failed ? "failed" : "completed",
+      status: succeeded ? "completed" : "failed",
       childRunId,
       childIssueId: issue.id,
       childIssueIdentifier: issue.identifier ?? null,
       finalText,
       costUsd: costCents / 100,
-      errorCode: failed ? childRow.errorCode ?? "child_run_failed" : null,
-      errorMessage: failed ? childRow.error ?? null : null,
+      errorCode: succeeded ? null : childRow.errorCode ?? "child_run_failed",
+      errorMessage: succeeded ? null : childRow.error ?? null,
     };
   };
 }

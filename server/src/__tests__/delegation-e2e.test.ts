@@ -5,6 +5,7 @@ import {
   agents,
   companies,
   createDb,
+  heartbeatRuns,
   issues,
   type Db,
 } from "@paperclipai/db";
@@ -116,6 +117,7 @@ describeUnit("delegation — unit", () => {
 
   afterEach(async () => {
     if (cleanupIds.length > 0) {
+      await db.delete(heartbeatRuns).where(inArray(heartbeatRuns.companyId, cleanupIds));
       await db.delete(issues).where(inArray(issues.companyId, cleanupIds));
       await db.delete(agents).where(inArray(agents.companyId, cleanupIds));
       await db.delete(companies).where(inArray(companies.id, cleanupIds));
@@ -195,6 +197,112 @@ describeUnit("delegation — unit", () => {
     expect(result.errorCode).toBeNull();
     expect(wakeupCalledWithAgentId).toBe(seed.directReport.id);
   });
+
+  // -------------------------------------------------------------------------
+  // Test 1b — Parent consumes child output (full delegation loop).
+  //
+  // Closes the Phase 0E acceptance gap exposed by the 2026-04-24 dogfood
+  // failure where Ada's delegate_task never received a tool_result even
+  // though Donald's child run produced a clean finalText. Root cause: the
+  // poller checked for status "done" while the runtime writes "succeeded",
+  // so the poller spun to timeout and the issue was never flipped.
+  //
+  // This test asserts the full loop at the delegation-service layer (the
+  // adapter layer on top just JSON.stringifies the DelegationResult into
+  // postCustomToolResult, so if the result here is right the tool_result
+  // posted to the parent MA session necessarily carries it):
+  //
+  //   1. Poller detects SUCCEEDED terminal status (not "done")
+  //   2. result.finalText matches the exact bytes the child wrote to
+  //      resultJson.finalText (the acceptance marker proves identity, not
+  //      shape)
+  //   3. Child issue flipped to "done" so reconciler stops re-waking via
+  //      issue.continuation_recovery
+  //   4. result.status === "completed", errorCode null
+  // -------------------------------------------------------------------------
+  it("Test 1b — parent receives child finalText + issue flipped to done", async () => {
+    const seed = await seedDelegationCompany(db);
+    cleanupIds.push(seed.companyId);
+
+    const parentRunId = randomUUID();
+    const childRunId = randomUUID();
+    const childFinalText =
+      "### CHAA-3 hygiene audit — 0 stale, 1 duplicate pair, 0 contradictions. ACCEPTANCE-MARKER-2f3a9c7e.";
+
+    // Pre-seed parent heartbeat_run so any FK from child.parentRunId holds.
+    await db.insert(heartbeatRuns).values({
+      id: parentRunId,
+      companyId: seed.companyId,
+      agentId: seed.parentAgent.id,
+      status: "running",
+      invocationSource: "on_demand",
+    } as Parameters<typeof db.insert>[0] extends unknown ? Record<string, unknown> : never);
+
+    const delegateTask = createDelegateTaskCallback({
+      db,
+      heartbeat: {
+        wakeup: async (agentId: string, opts) => {
+          // Insert the child run the way the real heartbeat service would.
+          await db.insert(heartbeatRuns).values({
+            id: childRunId,
+            companyId: seed.companyId,
+            agentId,
+            status: "queued",
+            invocationSource: "assignment",
+            parentRunId: opts.parentRunId ?? null,
+          } as Parameters<typeof db.insert>[0] extends unknown ? Record<string, unknown> : never);
+          // Simulate asynchronous completion — the poller's warmup is 3s, so
+          // flipping after 100ms means the first poll cycle will observe the
+          // terminal state.
+          setTimeout(() => {
+            db
+              .update(heartbeatRuns)
+              .set({
+                status: "succeeded",
+                finishedAt: new Date(),
+                resultJson: { finalText: childFinalText, stopReason: "completed" },
+                updatedAt: new Date(),
+              })
+              .where(eq(heartbeatRuns.id, childRunId))
+              .catch(() => {
+                /* test will fail on assertions if this fails; don't crash the event loop */
+              });
+          }, 100);
+          return { id: childRunId };
+        },
+      },
+      parentAgent: seed.parentAgent,
+      parentRunId,
+    });
+
+    const result = await delegateTask({
+      assigneeAgentName: seed.directReport.name,
+      title: "Run Cornerstone hygiene audit",
+      description: "Audit Mal's default namespace for stale facts, duplicates, contradictions.",
+      waitForCompletion: true,
+      timeoutSeconds: 30,
+    });
+
+    // Full-loop acceptance: parent receives the EXACT bytes the child wrote.
+    // The adapter posts JSON.stringify(result) as the tool_result, so
+    // anything asserted here is what the parent MA session observes.
+    expect(result.status).toBe("completed");
+    expect(result.finalText).toBe(childFinalText);
+    expect(result.finalText ?? "").toContain("ACCEPTANCE-MARKER-2f3a9c7e");
+    expect(result.errorCode).toBeNull();
+    expect(result.errorMessage).toBeNull();
+    expect(result.childRunId).toBe(childRunId);
+    expect(result.childIssueId).toBeTruthy();
+
+    // Issue must be flipped to done so the reconciler doesn't re-wake the
+    // assignee via issue.continuation_recovery.
+    const flippedIssue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, result.childIssueId!))
+      .then((rows) => rows[0] ?? null);
+    expect(flippedIssue?.status).toBe("done");
+  }, 15_000);
 
   // -------------------------------------------------------------------------
   // Test 4 — Not-a-direct-report rejection. Target resolves (same company)
