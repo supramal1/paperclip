@@ -276,7 +276,6 @@ function stewardInspectSpec(): MaCustomToolSpec {
         },
       },
       required: ["operation"],
-      additionalProperties: true,
     },
   };
 }
@@ -299,7 +298,6 @@ function stewardAdviseSpec(): MaCustomToolSpec {
         },
       },
       required: ["operation"],
-      additionalProperties: true,
     },
   };
 }
@@ -318,7 +316,6 @@ function stewardPreviewSpec(): MaCustomToolSpec {
         },
       },
       required: ["operation"],
-      additionalProperties: true,
     },
   };
 }
@@ -338,7 +335,6 @@ function stewardApplySpec(): MaCustomToolSpec {
         },
       },
       required: ["operation"],
-      additionalProperties: true,
     },
   };
 }
