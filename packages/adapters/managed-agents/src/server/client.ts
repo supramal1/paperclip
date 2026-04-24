@@ -153,18 +153,20 @@ export async function postCustomToolResult(
   resultText: string,
   isError = false,
 ): Promise<{ data: MaEvent[] }> {
+  // MA beta API shape (verified empirically 2026-04-24 via direct probe):
+  //   { type: "user.custom_tool_result",
+  //     custom_tool_use_id: "sevt_...",
+  //     is_error: bool,
+  //     content: [{ type: "text", text: "..." }] }
+  // Field name is custom_tool_use_id — NOT tool_use_id. Event.content items
+  // must be text/document/image/search_result.
   return maCall<{ data: MaEvent[] }>(apiKey, "POST", `/sessions/${sessionId}/events`, {
     events: [
       {
         type: "user.custom_tool_result",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: toolUseId,
-            content: [{ type: "text", text: resultText }],
-            is_error: isError,
-          },
-        ],
+        custom_tool_use_id: toolUseId,
+        is_error: isError,
+        content: [{ type: "text", text: resultText }],
       },
     ],
   });
