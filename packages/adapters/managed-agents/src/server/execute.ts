@@ -425,8 +425,33 @@ export async function execute(
   const delegateTask = ctx.delegateTask;
   const onCustomTool: CustomToolHandler | undefined = delegateTask
     ? async (ev: MaEvent) => {
-        const toolUseId = typeof ev.tool_use_id === "string" ? ev.tool_use_id : null;
-        const name = typeof ev.name === "string" ? ev.name : null;
+        // The MA API delivers tool-use details either as flat fields on the
+        // event (tool_use_id / name / input) or embedded in a content block
+        // with shape {type:"tool_use", id, name, input}. Read both shapes.
+        const flatToolUseId = typeof ev.tool_use_id === "string" ? ev.tool_use_id : null;
+        const flatName = typeof ev.name === "string" ? ev.name : null;
+        const flatInput = ev.input;
+        const contentBlocks = Array.isArray(ev.content) ? ev.content : [];
+        const toolBlock = contentBlocks.find(
+          (c): c is { type: string; id?: string; name?: string; input?: unknown } =>
+            !!c && typeof c === "object" && (c as { type?: unknown }).type === "tool_use",
+        );
+        const toolUseId =
+          flatToolUseId ?? (toolBlock && typeof toolBlock.id === "string" ? toolBlock.id : null);
+        const name =
+          flatName ?? (toolBlock && typeof toolBlock.name === "string" ? toolBlock.name : null);
+        const input = flatInput ?? toolBlock?.input;
+        await ctx.onLog(
+          "stdout",
+          JSON.stringify({
+            managed_agents_debug: "custom_tool_use_received",
+            evId: ev.id,
+            toolUseId,
+            name,
+            hasInput: input !== undefined,
+            rawEventKeys: Object.keys(ev),
+          }) + "\n",
+        );
         if (!toolUseId || !name) return;
         if (name !== DELEGATE_TASK_TOOL_NAME) {
           await postCustomToolResult(
@@ -438,7 +463,7 @@ export async function execute(
           );
           return;
         }
-        const parsed = parseDelegateTaskInput(ev.input);
+        const parsed = parseDelegateTaskInput(input);
         if ("error" in parsed) {
           await postCustomToolResult(
             apiKey,
