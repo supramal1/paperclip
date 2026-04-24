@@ -247,6 +247,19 @@ async function waitForIdle(
       }
     }
     const newThisCycle = seenIds.size - beforeSeen;
+    // `session.status_idle` with stop_reason="requires_action" is NOT terminal:
+    // it means the model has emitted a tool_use block and is waiting for the
+    // tool result. The next `agent.custom_tool_use` event may not be in the
+    // stream yet (race between status emission and tool_use event write), so
+    // we keep polling. Only end_turn / max_tokens / stop_sequence / tool-less
+    // pauses are real terminal states. Verified empirically 2026-04-24 via
+    // Ada session sesn_011CaPRJPSkKLhPzTo4i5q9R: get_context returned ok,
+    // post_tool_result_ok 434ms, then status_idle{requires_action} fired
+    // before the next custom_tool_use landed → adapter exited prematurely
+    // with reason=terminal_no_pending_tool, h1Detected=true.
+    const isHardTerminal =
+      sawStatusTerminated ||
+      (sawStatusIdle && lastIdleStopReason !== "requires_action");
     maDbg("waitForIdle_iter", {
       sessionId,
       iter,
@@ -257,10 +270,11 @@ async function waitForIdle(
       lastIdleStopReason,
       pendingCustomTool,
       sawTerminalThisCycle,
+      isHardTerminal,
       cycleMs: Date.now() - cycleStart,
       elapsedMs: Date.now() - start,
     });
-    if (sawTerminalThisCycle && !pendingCustomTool) {
+    if (isHardTerminal && !pendingCustomTool) {
       maDbg("waitForIdle_return", {
         sessionId,
         reason: "terminal_no_pending_tool",

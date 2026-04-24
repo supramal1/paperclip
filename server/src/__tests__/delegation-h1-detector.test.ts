@@ -470,4 +470,292 @@ describe("adapter managed-agents — H1 detector", () => {
       mock.restore();
     }
   }, 20_000);
+
+  // ---------------------------------------------------------------------------
+  // Bug 3 regression — requires_action is NOT terminal
+  //
+  // Context (2026-04-24, Ada session sesn_011CaPRJPSkKLhPzTo4i5q9R on
+  // paperclip-workforce-00035-fxf): Ada called get_context, the tool returned
+  // 1969 bytes status=ok, post_tool_result_ok in 434ms. Immediately after, MA
+  // emitted session.status_idle with stop_reason="requires_action" — meaning
+  // "model has emitted a tool_use block, waiting for tool_result". The
+  // adapter's pre-fix terminal-detection treated ANY status_idle as terminal,
+  // so it exited via terminal_no_pending_tool before the next
+  // agent.custom_tool_use event materialised in the events stream. Result:
+  // h1Detected=true, isError=true, finalTextLen=183.
+  //
+  // The fix (execute.ts:263 area): isHardTerminal excludes requires_action
+  //   isHardTerminal = sawStatusTerminated ||
+  //                    (sawStatusIdle && lastIdleStopReason !== "requires_action")
+  //
+  // This test drives the exact race: poll 1 returns status_idle{requires_action}
+  // without the next tool_use; poll 2 returns the next tool_use; adapter must
+  // dispatch the second tool, post its result, then synthesise on poll 3.
+  // ---------------------------------------------------------------------------
+  it("does not terminate on session.status_idle with stop_reason=requires_action — keeps polling", async () => {
+    const SESSION_ID = "sesn_test_requires_action";
+    const AGENT_ID = "agnt_requires_action";
+    const ENV_ID = "envr_requires_action";
+    const TOOL_USE_ID_1 = "sevt_tool_use_1";
+    const TOOL_USE_ID_2 = "sevt_tool_use_2";
+
+    // Initial events: first tool_use + status_idle{requires_action}.
+    // This is the state the adapter sees on its first GET /events poll after
+    // POST /v1/sessions creation.
+    const initialEvents: MaEventStub[] = [
+      {
+        id: "sevt_span_1",
+        type: "span.model_request_end",
+        model_usage: {
+          input_tokens: 3,
+          output_tokens: 200,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 19300,
+        },
+      },
+      {
+        id: TOOL_USE_ID_1,
+        type: "agent.custom_tool_use",
+        name: "delegate_task",
+        input: {
+          assignee_agent_name: "Donald",
+          title: "first",
+          description: "first call",
+          wait: true,
+        },
+      },
+      {
+        id: "sevt_idle_after_tool_1",
+        type: "session.status_idle",
+        stop_reason: { type: "requires_action" },
+      },
+    ];
+
+    let toolResult1Posted = false;
+    let toolResult2Posted = false;
+    // Track whether we've completed the "requires_action with no new tool yet"
+    // poll cycle. Pre-fix this was where the adapter would exit. Post-fix it
+    // must continue to the next poll where the second tool_use lands.
+    let postedToolResult1Polls = 0;
+
+    const mock = installMaFetch((method, path, body) => {
+      if (method === "POST" && path === "/v1/agents") {
+        return {
+          status: 200,
+          body: {
+            id: AGENT_ID,
+            version: 1,
+            model: { id: "claude-haiku-4-5-20251001" },
+            name: "t",
+            system: "",
+          },
+        };
+      }
+      if (method === "POST" && path === "/v1/environments") {
+        return { status: 200, body: { id: ENV_ID, state: "r", name: "t" } };
+      }
+      if (method === "POST" && path === "/v1/sessions") {
+        return {
+          status: 200,
+          body: {
+            id: SESSION_ID,
+            status: "running",
+            environment_id: ENV_ID,
+            agent: { id: AGENT_ID, version: 1 },
+            usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+            stats: { active_seconds: 0, duration_seconds: 0 },
+          },
+        };
+      }
+      if (method === "POST" && path === `/v1/sessions/${SESSION_ID}/events`) {
+        const rec = body as { events?: Array<Record<string, unknown>> } | null;
+        const ev = rec?.events?.[0];
+        if (ev?.type === "user.custom_tool_result") {
+          if (ev.custom_tool_use_id === TOOL_USE_ID_1) toolResult1Posted = true;
+          else if (ev.custom_tool_use_id === TOOL_USE_ID_2) toolResult2Posted = true;
+        }
+        return { status: 200, body: { data: [] } };
+      }
+      if (method === "GET" && path === `/v1/sessions/${SESSION_ID}/events`) {
+        if (!toolResult1Posted) {
+          return { status: 200, body: { data: initialEvents } };
+        }
+        // First poll AFTER tool_result_1: simulate the race — status_idle
+        // already emitted with requires_action, but the next tool_use event
+        // hasn't landed yet. Pre-fix this is where the bug fired.
+        if (postedToolResult1Polls === 0) {
+          postedToolResult1Polls += 1;
+          return {
+            status: 200,
+            body: {
+              data: [
+                ...initialEvents,
+                {
+                  id: "sevt_tool_result_echo_1",
+                  type: "user.custom_tool_result",
+                  custom_tool_use_id: TOOL_USE_ID_1,
+                },
+              ],
+            },
+          };
+        }
+        // Second poll: the next tool_use event lands.
+        if (!toolResult2Posted) {
+          return {
+            status: 200,
+            body: {
+              data: [
+                ...initialEvents,
+                {
+                  id: "sevt_tool_result_echo_1",
+                  type: "user.custom_tool_result",
+                  custom_tool_use_id: TOOL_USE_ID_1,
+                },
+                {
+                  id: "sevt_span_2",
+                  type: "span.model_request_end",
+                  model_usage: {
+                    input_tokens: 5,
+                    output_tokens: 150,
+                    cache_read_input_tokens: 19300,
+                    cache_creation_input_tokens: 0,
+                  },
+                },
+                {
+                  id: TOOL_USE_ID_2,
+                  type: "agent.custom_tool_use",
+                  name: "delegate_task",
+                  input: {
+                    assignee_agent_name: "Donald",
+                    title: "second",
+                    description: "second call",
+                    wait: true,
+                  },
+                },
+                {
+                  id: "sevt_idle_after_tool_2",
+                  type: "session.status_idle",
+                  stop_reason: { type: "requires_action" },
+                },
+              ],
+            },
+          };
+        }
+        // Third poll: synthesis span + final message + end_turn.
+        return {
+          status: 200,
+          body: {
+            data: [
+              ...initialEvents,
+              {
+                id: "sevt_tool_result_echo_1",
+                type: "user.custom_tool_result",
+                custom_tool_use_id: TOOL_USE_ID_1,
+              },
+              {
+                id: "sevt_span_2",
+                type: "span.model_request_end",
+                model_usage: {
+                  input_tokens: 5,
+                  output_tokens: 150,
+                  cache_read_input_tokens: 19300,
+                  cache_creation_input_tokens: 0,
+                },
+              },
+              {
+                id: TOOL_USE_ID_2,
+                type: "agent.custom_tool_use",
+                name: "delegate_task",
+                input: {
+                  assignee_agent_name: "Donald",
+                  title: "second",
+                  description: "second call",
+                  wait: true,
+                },
+              },
+              {
+                id: "sevt_idle_after_tool_2",
+                type: "session.status_idle",
+                stop_reason: { type: "requires_action" },
+              },
+              {
+                id: "sevt_tool_result_echo_2",
+                type: "user.custom_tool_result",
+                custom_tool_use_id: TOOL_USE_ID_2,
+              },
+              {
+                id: "sevt_span_3",
+                type: "span.model_request_end",
+                model_usage: {
+                  input_tokens: 8,
+                  output_tokens: 800,
+                  cache_read_input_tokens: 19300,
+                  cache_creation_input_tokens: 0,
+                },
+              },
+              {
+                id: "sevt_msg_synthesis",
+                type: "agent.message",
+                content: [
+                  { type: "text", text: "Synthesis after two tool calls." },
+                ],
+              },
+              {
+                id: "sevt_idle_end_turn",
+                type: "session.status_idle",
+                stop_reason: { type: "end_turn" },
+              },
+            ],
+          },
+        };
+      }
+      if (method === "GET" && path === `/v1/sessions/${SESSION_ID}`) {
+        return {
+          status: 200,
+          body: {
+            id: SESSION_ID,
+            status: "idle",
+            environment_id: ENV_ID,
+            agent: { id: AGENT_ID, version: 1 },
+            usage: { input_tokens: 8, output_tokens: 1150, cache_read_input_tokens: 19300 },
+            stats: { active_seconds: 32, duration_seconds: 40 },
+          },
+        };
+      }
+      return { status: 404, body: { error: `unmocked ${method} ${path}` } };
+    });
+
+    let delegateCalls = 0;
+    const delegateTask = async (): Promise<DelegationResult> => {
+      delegateCalls += 1;
+      return {
+        status: "completed",
+        childRunId: `c-${delegateCalls}`,
+        childIssueId: "i",
+        childIssueIdentifier: `X-${delegateCalls}`,
+        finalText: `Donald output ${delegateCalls}`,
+        costUsd: 0.1,
+        errorCode: null,
+        errorMessage: null,
+      };
+    };
+
+    try {
+      const result = await execute(
+        buildCtx({ runId: "requires-action-run", delegateTask }),
+      );
+      // Both tool calls dispatched.
+      expect(delegateCalls).toBe(2);
+      // Both tool results posted (proves adapter survived the requires_action idle).
+      expect(toolResult1Posted).toBe(true);
+      expect(toolResult2Posted).toBe(true);
+      // Session synthesised cleanly — no H1 false-positive, exit code 0.
+      expect(result.exitCode).toBe(0);
+      expect(result.errorCode ?? null).toBeNull();
+      const rj = result.resultJson as Record<string, unknown> | undefined;
+      expect(rj?.finalText as string).toContain("Synthesis after two tool calls");
+    } finally {
+      mock.restore();
+    }
+  }, 20_000);
 });
