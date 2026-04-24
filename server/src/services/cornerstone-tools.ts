@@ -70,10 +70,13 @@ const WRITE_TOOLS: ReadonlySet<CornerstoneToolName> = new Set([
 export type { CornerstoneToolRequest, CornerstoneToolResult, CornerstoneToolStatus, CornerstoneToolsCallback };
 
 export interface CornerstoneToolsDeps {
-  db: Db;
+  db?: Db;
   companyId: string;
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  // Test hook. Prod path resolves via secretService(db).getByName + latest
+  // version decrypt; tests pass a plain string to skip DB wiring.
+  apiKeyResolver?: () => Promise<string>;
 }
 
 function isCornerstoneToolName(name: string): name is CornerstoneToolName {
@@ -152,19 +155,27 @@ const STEWARD_PREVIEW_OPERATIONS: Readonly<Record<string, string>> = {
 export function createCornerstoneToolsCallback(
   deps: CornerstoneToolsDeps,
 ): CornerstoneToolsCallback {
-  const secrets = secretService(deps.db);
   const baseUrl = (deps.apiBaseUrl ?? DEFAULT_CORNERSTONE_API_BASE_URL).replace(/\/+$/, "");
   const doFetch = deps.fetchImpl ?? fetch;
 
-  async function resolveApiKey(): Promise<string> {
-    const secret = await secrets.getByName(deps.companyId, CORNERSTONE_API_KEY_SECRET_NAME);
-    if (!secret) {
-      throw new CornerstoneToolConfigError(
-        "cornerstone_api_key_missing",
-        `Company ${deps.companyId} has no ${CORNERSTONE_API_KEY_SECRET_NAME} secret configured`,
-      );
+  let resolveApiKey: () => Promise<string>;
+  if (deps.apiKeyResolver) {
+    resolveApiKey = deps.apiKeyResolver;
+  } else {
+    if (!deps.db) {
+      throw new Error("createCornerstoneToolsCallback requires either `db` or `apiKeyResolver`");
     }
-    return secrets.resolveSecretValue(deps.companyId, secret.id, "latest");
+    const secrets = secretService(deps.db);
+    resolveApiKey = async () => {
+      const secret = await secrets.getByName(deps.companyId, CORNERSTONE_API_KEY_SECRET_NAME);
+      if (!secret) {
+        throw new CornerstoneToolConfigError(
+          "cornerstone_api_key_missing",
+          `Company ${deps.companyId} has no ${CORNERSTONE_API_KEY_SECRET_NAME} secret configured`,
+        );
+      }
+      return secrets.resolveSecretValue(deps.companyId, secret.id, "latest");
+    };
   }
 
   async function callApi(
