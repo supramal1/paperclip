@@ -157,9 +157,14 @@ export async function postCustomToolResult(
     events: [
       {
         type: "user.custom_tool_result",
-        tool_use_id: toolUseId,
-        is_error: isError,
-        content: [{ type: "text", text: resultText }],
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseId,
+            content: [{ type: "text", text: resultText }],
+            is_error: isError,
+          },
+        ],
       },
     ],
   });
