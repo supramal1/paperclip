@@ -10,7 +10,7 @@
 //
 // Add `--apply` to persist. Without it the script dry-runs.
 
-import { createDb } from "@paperclipai/db";
+import { createDb } from "../packages/db/src/index.js";
 import { secretService } from "../server/src/services/secrets.js";
 
 const SECRET_NAME = "CORNERSTONE_API_KEY";
