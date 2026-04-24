@@ -140,7 +140,9 @@ describe("cornerstone-tools handler — per-tool dispatch", () => {
     expect(calls[0]).toMatchObject({ method: "GET", path: "/ops/maintenance/jobs/abc%20123" });
   });
 
-  it("steward_inspect dispatches each operation to its /ops/steward/inspect/<op> endpoint", async () => {
+  it("steward_inspect dispatches each operation to its /ops/steward/inspect/<op> endpoint via GET with query params", async () => {
+    // Inspect endpoints are read-only and GET-only on the Cornerstone side
+    // (POST → 405). The handler must use GET + query, NOT POST + body.
     const { dispatch, calls } = makeCallback(() => ok({ items: [] }));
     const ops = [
       "duplicates",
@@ -161,8 +163,9 @@ describe("cornerstone-tools handler — per-tool dispatch", () => {
     }
     expect(calls.map((c) => c.path)).toEqual(ops.map((op) => `/ops/steward/inspect/${op}`));
     for (const call of calls) {
-      expect(call.method).toBe("POST");
-      expect((call.body as { namespace?: string }).namespace).toBe("aiops");
+      expect(call.method).toBe("GET");
+      expect(call.body).toBeNull();
+      expect(call.query.namespace).toBe("aiops");
     }
   });
 

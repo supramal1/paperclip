@@ -441,8 +441,16 @@ export function createCornerstoneToolsCallback(
         `${tool} does not support operation \`${operation}\`. Supported: ${Object.keys(table).join(", ")}`,
       );
     }
-    const body = buildStewardRequestBody(input, namespace);
-    const res = await callApi("POST", path, { body });
+    // Cornerstone API: /ops/steward/inspect/* is GET-only (read-only query),
+    // /ops/steward/advise/* is POST-only (takes a plan-generation body).
+    // Verified empirically 2026-04-24: POST /inspect/duplicates → 405,
+    // GET /advise/merge → 405. Ada's audit failed because all four parallel
+    // steward_inspect calls 405'd, every tool_result came back isError=true,
+    // MA hit requires_action and terminated without a synthesis span.
+    const res =
+      tool === "steward_inspect"
+        ? await callApi("GET", path, { query: buildStewardQueryParams(input, namespace) })
+        : await callApi("POST", path, { body: buildStewardRequestBody(input, namespace) });
     if (!res.ok) {
       return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
     }
@@ -517,4 +525,22 @@ function buildStewardRequestBody(
   }
   if (namespace) passthrough.namespace = namespace;
   return passthrough;
+}
+
+function buildStewardQueryParams(
+  input: Record<string, unknown>,
+  namespace: string | null,
+): Record<string, string> {
+  // Query-string variant for GET endpoints (steward_inspect). Scalar-only —
+  // GET /inspect/* doesn't accept complex shapes, so silently drop nested
+  // objects/arrays rather than serialising them incorrectly.
+  const query: Record<string, string> = {};
+  for (const [k, v] of Object.entries(input)) {
+    if (k === "namespace" || k === "operation") continue;
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string") query[k] = v;
+    else if (typeof v === "number" || typeof v === "boolean") query[k] = String(v);
+  }
+  if (namespace) query.namespace = namespace;
+  return query;
 }
