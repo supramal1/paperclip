@@ -252,7 +252,13 @@ export function createCornerstoneToolsCallback(
     const input = asRecord(req.input) ?? {};
     const isWrite = WRITE_TOOLS.has(toolName);
     const namespaceRaw = readOptionalString(input.namespace);
-    const namespace = isWrite ? AI_OPS_WRITE_WORKSPACE : namespaceRaw;
+    // Writes force aiops regardless of input. Reads default to aiops when the
+    // agent omits namespace — Workforce service principals are aiops-scoped,
+    // and an empty namespace round-trips to the API as namespace_required 403.
+    // An agent-supplied read namespace still passes through unchanged.
+    const namespace = isWrite
+      ? AI_OPS_WRITE_WORKSPACE
+      : (namespaceRaw ?? AI_OPS_WRITE_WORKSPACE);
 
     try {
       switch (toolName) {

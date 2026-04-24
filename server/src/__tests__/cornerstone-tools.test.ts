@@ -247,10 +247,20 @@ describe("cornerstone-tools handler — namespace scoping (security invariant)",
     expect((calls[2].body as { namespace: string }).namespace).toBe("aiops");
   });
 
-  it("read tool with no namespace input sends namespace=\"\" (lets API use the default)", async () => {
+  it("read tool with no namespace input defaults namespace to aiops (Workforce principals are aiops-scoped)", async () => {
     const { dispatch, calls } = makeCallback(() => ok({}));
     await dispatch({ name: "get_context", input: { query: "x" } });
-    expect((calls[0].body as { namespace: string }).namespace).toBe("");
+    await dispatch({ name: "search", input: { query: "x" } });
+    await dispatch({ name: "list_facts", input: {} });
+    await dispatch({ name: "recall", input: { query: "x" } });
+    await dispatch({ name: "steward_inspect", input: { operation: "duplicates" } });
+    expect((calls[0].body as { namespace: string }).namespace).toBe(AI_OPS_WRITE_WORKSPACE);
+    expect((calls[1].body as { namespace: string }).namespace).toBe(AI_OPS_WRITE_WORKSPACE);
+    // list_facts is GET — namespace lives in query string
+    expect(calls[2].query?.namespace).toBe(AI_OPS_WRITE_WORKSPACE);
+    expect((calls[3].body as { namespace: string }).namespace).toBe(AI_OPS_WRITE_WORKSPACE);
+    // steward_inspect is GET — namespace lives in query string
+    expect(calls[4].query?.namespace).toBe(AI_OPS_WRITE_WORKSPACE);
   });
 });
 
