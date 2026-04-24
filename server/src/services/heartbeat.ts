@@ -6737,11 +6737,21 @@ export function heartbeatService(db: Db) {
         coalescedTargetRun.contextSnapshot,
         contextSnapshot,
       );
+      // Preserve parentRunId across coalescing. Delegation-originated wakeups
+      // carry parentRunId for cost/lineage attribution; if an earlier wakeup
+      // created the run without it, fill it in on merge so child-cost rollups
+      // to the delegating parent still work. Never overwrite an existing
+      // parentRunId (first-writer-wins keeps lineage stable).
+      const shouldSetParentRunId =
+        !coalescedTargetRun.parentRunId &&
+        typeof opts.parentRunId === "string" &&
+        opts.parentRunId.length > 0;
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
+          ...(shouldSetParentRunId ? { parentRunId: opts.parentRunId } : {}),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
         .returning()
