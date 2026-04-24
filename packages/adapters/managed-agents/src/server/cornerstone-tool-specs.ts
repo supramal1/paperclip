@@ -284,7 +284,7 @@ function stewardAdviseSpec(): MaCustomToolSpec {
   return {
     name: "steward_advise",
     description:
-      "Request a steward recommendation (merge plan, consolidation plan, taxonomy suggestion). Read-only: returns suggestions an operator can review before running a mutating preview/apply.",
+      "Request a steward recommendation (merge plan, consolidation plan, taxonomy suggestion). Read-only: returns suggestions an operator can review before running a mutating preview/apply. Each operation requires a candidate list — typically gathered from a prior steward_inspect call: pass the inspect rows back in as the operation-specific field.",
     input_schema: {
       type: "object",
       properties: {
@@ -296,6 +296,35 @@ function stewardAdviseSpec(): MaCustomToolSpec {
           type: "string",
           description: "Optional workspace scope.",
         },
+        items: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "Required for operation=merge and operation=stale-review. Pairs/items from a prior steward_inspect call (e.g. inspect duplicates → advise merge, inspect stale → advise stale-review).",
+        },
+        item_type: {
+          type: "string",
+          description:
+            "Optional for operation=merge. Either 'fact' (default) or 'note', matching the source_type of the items.",
+        },
+        facts: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "Required for operation=consolidate. Fact rows (from inspect duplicates or inspect key-taxonomy) to ask the steward to consolidate into one.",
+        },
+        inconsistencies: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "Required for operation=key-taxonomy. Naming inconsistencies — typically the rows returned by steward_inspect with operation=key-taxonomy.",
+        },
+        pairs: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "Required for operation=contradictions. Contradicting fact pairs from a prior steward_inspect with operation=contradictions.",
+        },
       },
       required: ["operation"],
     },
@@ -306,13 +335,77 @@ function stewardPreviewSpec(): MaCustomToolSpec {
   return {
     name: "steward_preview",
     description:
-      "Dry-run a mutating steward operation against the aiops workspace. Returns the exact changes that would be applied by steward_apply, without touching memory. Safe to call; namespace is always forced to aiops.",
+      "Dry-run a mutating steward operation against the aiops workspace. Returns the exact changes that would be applied by steward_apply, without touching memory. Safe to call; namespace is always forced to aiops. Per-operation required fields are described below — operations like delete-by-filter and rename-keys reject empty bodies (no-op delete = 400).",
     input_schema: {
       type: "object",
       properties: {
         operation: {
           type: "string",
           description: `Which mutation to preview. One of: ${STEWARD_PREVIEW_OPERATIONS.join(", ")}.`,
+        },
+        similarity_threshold: {
+          type: "number",
+          description:
+            "Optional for merge-duplicates and merge-notes (default 0.85, range 0-1). Lower = more aggressive grouping.",
+        },
+        limit: {
+          type: "integer",
+          description:
+            "Optional for merge-duplicates, merge-notes, archive-stale (default 500). Caps the number of candidate rows scanned.",
+        },
+        days_threshold: {
+          type: "integer",
+          description:
+            "Optional for archive-stale (default 90). Rows untouched for N days become candidates.",
+        },
+        source_type: {
+          type: "string",
+          description:
+            "Optional for delete-by-filter (default 'fact'). Either 'fact' or 'note'.",
+        },
+        item_ids: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional for delete-by-filter. SM ids to delete. Most callers should use `keys` instead — this is for internal id-based deletes.",
+        },
+        keys: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Optional for delete-by-filter. Fact keys to delete (resolved server-side). Preferred when you know the keys.",
+        },
+        confidence_below: {
+          type: "number",
+          description:
+            "Optional for delete-by-filter. Delete rows with confidence below this threshold (0-1).",
+        },
+        created_before: {
+          type: "string",
+          description:
+            "Optional for delete-by-filter. ISO date — delete rows created before this date.",
+        },
+        content_filter: {
+          type: "string",
+          description:
+            "Optional for delete-by-filter. Substring match on content. delete-by-filter requires AT LEAST ONE of: item_ids, keys, confidence_below, created_before, content_filter, tags.",
+        },
+        tags: {
+          type: "array",
+          items: { type: "string" },
+          description: "Optional for delete-by-filter. Match rows tagged with any of these.",
+        },
+        fact_ids: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Required for consolidate-facts. Fact ids to merge into a single consolidated fact.",
+        },
+        mappings: {
+          type: "array",
+          items: { type: "object" },
+          description:
+            "Required for rename-keys. List of {from: oldKey, to: newKey} mappings.",
         },
       },
       required: ["operation"],
