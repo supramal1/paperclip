@@ -3,6 +3,10 @@ import type {
   AdapterExecutionResult,
   DelegationRequest,
 } from "@paperclipai/adapter-utils";
+import {
+  buildCornerstoneToolSpecs,
+  isCornerstoneToolName,
+} from "./cornerstone-tool-specs.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
   createAgent,
@@ -450,9 +454,11 @@ export async function execute(
     agentId
       ? Promise.resolve({ id: agentId, version: agentVersion ?? 1 })
       : (async () => {
-          const customTools = ctx.delegateTask
-            ? [buildDelegateTaskToolSpec()]
-            : undefined;
+          const customToolsList: MaCustomToolSpec[] = [
+            ...(ctx.delegateTask ? [buildDelegateTaskToolSpec()] : []),
+            ...(ctx.cornerstoneTools ? buildCornerstoneToolSpecs() : []),
+          ];
+          const customTools = customToolsList.length > 0 ? customToolsList : undefined;
           const a = await createAgent(apiKey, {
             name: `paperclip-${ctx.agent.companyId.slice(0, 8)}-${ctx.agent.id.slice(0, 8)}`,
             model,
@@ -519,6 +525,7 @@ export async function execute(
     companyId: ctx.agent.companyId,
     paperclipAgentId: ctx.agent.id,
     hasDelegateTask: Boolean(ctx.delegateTask),
+    hasCornerstoneTools: Boolean(ctx.cornerstoneTools),
     timeoutSec,
   });
 
@@ -543,6 +550,7 @@ export async function execute(
   };
 
   const delegateTask = ctx.delegateTask;
+  const cornerstoneTools = ctx.cornerstoneTools;
   // Wrapper around postCustomToolResult that emits structured stdout logs
   // before/after the HTTP call. Used instead of calling postCustomToolResult
   // directly so every post is traceable in Cloud Logging with the tool_use_id,
@@ -595,7 +603,14 @@ export async function execute(
     }
   };
 
-  const onCustomTool: CustomToolHandler | undefined = delegateTask
+  // Single onCustomTool dispatcher. Active whenever *any* callback-backed
+  // custom tool is wired (delegate_task or the Cornerstone tools). Routes by
+  // tool name: delegate_task → delegateTask callback; the 11 Cornerstone
+  // tools → cornerstoneTools callback. Unknown tools post a structured error.
+  // Keeping one path preserves the H1 invariant (spanCount >=
+  // customToolUseCount + 1) across mixed tool use in a single session.
+  const customToolBound = Boolean(delegateTask) || Boolean(cornerstoneTools);
+  const onCustomTool: CustomToolHandler | undefined = customToolBound
     ? async (ev: MaEvent) => {
         // On agent.custom_tool_use, the event's own `id` is the tool_use_id
         // (no separate tool_use_id field exists). name/input are flat on the
@@ -631,57 +646,115 @@ export async function execute(
           }) + "\n",
         );
         if (!toolUseId || !name) return;
-        if (name !== DELEGATE_TASK_TOOL_NAME) {
-          await postToolResultLogged(
-            toolUseId,
-            JSON.stringify({ error: `unknown tool: ${name}` }),
-            true,
-            "unknown_tool",
-          );
+
+        // Route: delegate_task
+        if (name === DELEGATE_TASK_TOOL_NAME) {
+          if (!delegateTask) {
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify({ error: `tool not bound: ${name}` }),
+              true,
+              "tool_not_bound",
+            );
+            return;
+          }
+          const parsed = parseDelegateTaskInput(input);
+          if ("error" in parsed) {
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify({ error: parsed.error }),
+              true,
+              "parse_error",
+            );
+            return;
+          }
+          try {
+            const result = await delegateTask(parsed);
+            maDbg("delegate_task_result", {
+              sessionId,
+              toolUseId,
+              status: result.status,
+              childRunId: result.childRunId ?? null,
+              childIssueId: result.childIssueId ?? null,
+              errorCode: result.errorCode ?? null,
+            });
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify(result),
+              result.status === "failed" ||
+                result.status === "rejected" ||
+                result.status === "timeout",
+              "delegate_task_result",
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            maDbg(
+              "delegate_task_threw",
+              { sessionId, toolUseId, error: msg },
+              "ERROR",
+            );
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify({ error: msg, status: "failed" }),
+              true,
+              "delegate_task_exception",
+            );
+          }
           return;
         }
-        const parsed = parseDelegateTaskInput(input);
-        if ("error" in parsed) {
-          await postToolResultLogged(
-            toolUseId,
-            JSON.stringify({ error: parsed.error }),
-            true,
-            "parse_error",
-          );
+
+        // Route: Cornerstone tools (get_context, search, list_facts, recall,
+        // add_fact, save_conversation, steward_inspect, steward_advise,
+        // steward_preview, steward_apply, steward_status).
+        if (isCornerstoneToolName(name)) {
+          if (!cornerstoneTools) {
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify({ error: `tool not bound: ${name}` }),
+              true,
+              "tool_not_bound",
+            );
+            return;
+          }
+          try {
+            const result = await cornerstoneTools({ name, input });
+            maDbg("cornerstone_tool_result", {
+              sessionId,
+              toolUseId,
+              toolName: name,
+              status: result.status,
+              errorCode: result.errorCode ?? null,
+            });
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify(result),
+              result.status !== "ok",
+              `cornerstone_${name}_result`,
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            maDbg(
+              "cornerstone_tool_threw",
+              { sessionId, toolUseId, toolName: name, error: msg },
+              "ERROR",
+            );
+            await postToolResultLogged(
+              toolUseId,
+              JSON.stringify({ status: "error", errorMessage: msg }),
+              true,
+              `cornerstone_${name}_exception`,
+            );
+          }
           return;
         }
-        try {
-          const result = await delegateTask(parsed);
-          maDbg("delegate_task_result", {
-            sessionId,
-            toolUseId,
-            status: result.status,
-            childRunId: result.childRunId ?? null,
-            childIssueId: result.childIssueId ?? null,
-            errorCode: result.errorCode ?? null,
-          });
-          await postToolResultLogged(
-            toolUseId,
-            JSON.stringify(result),
-            result.status === "failed" ||
-              result.status === "rejected" ||
-              result.status === "timeout",
-            "delegate_task_result",
-          );
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          maDbg(
-            "delegate_task_threw",
-            { sessionId, toolUseId, error: msg },
-            "ERROR",
-          );
-          await postToolResultLogged(
-            toolUseId,
-            JSON.stringify({ error: msg, status: "failed" }),
-            true,
-            "delegate_task_exception",
-          );
-        }
+
+        // Unknown tool — mirrors prior behaviour.
+        await postToolResultLogged(
+          toolUseId,
+          JSON.stringify({ error: `unknown tool: ${name}` }),
+          true,
+          "unknown_tool",
+        );
       }
     : undefined;
 

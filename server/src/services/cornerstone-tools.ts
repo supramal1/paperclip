@@ -1,4 +1,10 @@
 import type { Db } from "@paperclipai/db";
+import type {
+  CornerstoneToolRequest,
+  CornerstoneToolResult,
+  CornerstoneToolStatus,
+  CornerstoneToolsCallback,
+} from "@paperclipai/adapter-utils";
 import { secretService } from "./secrets.js";
 
 // ---------------------------------------------------------------------------
@@ -56,19 +62,7 @@ const WRITE_TOOLS: ReadonlySet<CornerstoneToolName> = new Set([
   "steward_apply",
 ]);
 
-export interface CornerstoneToolRequest {
-  name: CornerstoneToolName;
-  input: unknown;
-}
-
-export type CornerstoneToolStatus = "ok" | "error" | "pending_approval";
-
-export interface CornerstoneToolResult {
-  status: CornerstoneToolStatus;
-  output?: unknown;
-  errorCode?: string | null;
-  errorMessage?: string | null;
-}
+export type { CornerstoneToolRequest, CornerstoneToolResult, CornerstoneToolStatus, CornerstoneToolsCallback };
 
 export interface CornerstoneToolsDeps {
   db: Db;
@@ -77,9 +71,9 @@ export interface CornerstoneToolsDeps {
   fetchImpl?: typeof fetch;
 }
 
-export type CornerstoneToolsCallback = (
-  req: CornerstoneToolRequest,
-) => Promise<CornerstoneToolResult>;
+function isCornerstoneToolName(name: string): name is CornerstoneToolName {
+  return (CORNERSTONE_TOOL_NAMES as readonly string[]).includes(name);
+}
 
 // ---------------------------------------------------------------------------
 // Input guards
@@ -227,21 +221,25 @@ export function createCornerstoneToolsCallback(
   }
 
   async function dispatch(req: CornerstoneToolRequest): Promise<CornerstoneToolResult> {
-    if (BLOCKED_TOOLS.has(req.name)) {
+    if (!isCornerstoneToolName(req.name)) {
+      return errorResult("unknown_tool", `Unknown Cornerstone tool: ${req.name}`);
+    }
+    const toolName: CornerstoneToolName = req.name;
+    if (BLOCKED_TOOLS.has(toolName)) {
       return {
         status: "pending_approval",
         errorCode: "approval_queue_not_available",
         errorMessage:
-          `Destructive Cornerstone tool ${req.name} is gated pending the approval-queue UI (Bug 2 follow-up). Use steward_preview to see the intended effect and surface the audit as a recommendation.`,
+          `Destructive Cornerstone tool ${toolName} is gated pending the approval-queue UI (Bug 2 follow-up). Use steward_preview to see the intended effect and surface the audit as a recommendation.`,
       };
     }
     const input = asRecord(req.input) ?? {};
-    const isWrite = WRITE_TOOLS.has(req.name);
+    const isWrite = WRITE_TOOLS.has(toolName);
     const namespaceRaw = readOptionalString(input.namespace);
     const namespace = isWrite ? AI_OPS_WRITE_WORKSPACE : namespaceRaw;
 
     try {
-      switch (req.name) {
+      switch (toolName) {
         case "get_context":
           return await handleGetContext(input, namespace);
         case "search":
@@ -262,11 +260,9 @@ export function createCornerstoneToolsCallback(
           return await handleStewardPreview(input);
         case "steward_status":
           return await handleStewardStatus(input);
-        default:
-          return errorResult(
-            "unknown_tool",
-            `Unknown Cornerstone tool: ${(req as { name: string }).name}`,
-          );
+        case "steward_apply":
+          // Unreachable — steward_apply is short-circuited by BLOCKED_TOOLS above.
+          return errorResult("approval_queue_not_available", "steward_apply blocked");
       }
     } catch (err) {
       if (err instanceof CornerstoneToolConfigError) {

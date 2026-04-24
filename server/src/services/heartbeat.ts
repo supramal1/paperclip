@@ -46,6 +46,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { canAgentDelegate, createDelegateTaskCallback } from "./delegation.js";
+import { createCornerstoneToolsCallback } from "./cornerstone-tools.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
@@ -5492,6 +5493,17 @@ export function heartbeatService(db: Db) {
             parentRunId: run.id,
           })
         : undefined;
+      // canUseCornerstone gate mirrors the canDelegate pattern. Any adapter
+      // that honours ctx.cornerstoneTools (currently managed-agents) will
+      // surface the 11 Cornerstone tools to the model iff this callback is
+      // present. Adapters that don't honour it see a no-op — safe default.
+      const cornerstoneAllowed = asBoolean(agentPermissions.canUseCornerstone, false);
+      const cornerstoneTools = cornerstoneAllowed
+        ? createCornerstoneToolsCallback({
+            db,
+            companyId: agent.companyId,
+          })
+        : undefined;
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -5512,6 +5524,7 @@ export function heartbeatService(db: Db) {
         },
         authToken: authToken ?? undefined,
         delegateTask,
+        cornerstoneTools,
       });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
