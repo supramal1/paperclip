@@ -181,7 +181,6 @@ function buildDelegateTaskToolSpec(): MaCustomToolSpec {
       "Delegate a unit of work to one of your direct reports. Creates an issue assigned to the named agent and (if wait=true) blocks until the child run finishes, returning its final output. Only direct reports can be assignees. Nested delegation requires the assignee to have canDelegate permission.",
     input_schema: {
       type: "object",
-      additionalProperties: false,
       properties: {
         assignee_agent_name: {
           type: "string",
@@ -197,15 +196,11 @@ function buildDelegateTaskToolSpec(): MaCustomToolSpec {
         },
         wait: {
           type: "boolean",
-          description: "If true (default), block until the child run completes or times out.",
-          default: true,
+          description: "If true (default), block until the child run completes or times out. Default true.",
         },
         timeout_seconds: {
           type: "integer",
-          description: "Upper bound in seconds before returning status=timeout. Default 3600.",
-          default: 3600,
-          minimum: 60,
-          maximum: 14400,
+          description: "Upper bound in seconds before returning status=timeout. Default 3600 (range 60-14400).",
         },
       },
       required: ["assignee_agent_name", "title", "description"],
