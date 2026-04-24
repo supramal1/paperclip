@@ -24,6 +24,10 @@ import {
   issueDocuments,
   heartbeatRunEvents,
   heartbeatRuns,
+  HEARTBEAT_RUN_EXECUTION_PATH_STATUSES,
+  HEARTBEAT_RUN_CANCELLABLE_STATUSES,
+  HEARTBEAT_RUN_TERMINAL_STATUSES,
+  HEARTBEAT_RUN_UNSUCCESSFUL_TERMINAL_STATUSES,
   issueComments,
   issueRelations,
   issues,
@@ -135,10 +139,11 @@ const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
 const execFile = promisify(execFileCallback);
-const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "failed", "cancelled", "timed_out"] as const;
-const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "timed_out"] as const;
+// Status literal sets are imported from @paperclipai/db so the schema owns
+// the source of truth. Local aliases keep existing call sites unchanged.
+const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = HEARTBEAT_RUN_EXECUTION_PATH_STATUSES;
+const CANCELLABLE_HEARTBEAT_RUN_STATUSES = HEARTBEAT_RUN_CANCELLABLE_STATUSES;
+const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = HEARTBEAT_RUN_UNSUCCESSFUL_TERMINAL_STATUSES;
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
   2 * 60 * 1000,
   10 * 60 * 1000,

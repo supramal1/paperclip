@@ -3,6 +3,46 @@ import { companies } from "./companies.js";
 import { agents } from "./agents.js";
 import { agentWakeupRequests } from "./agent_wakeup_requests.js";
 
+/**
+ * Canonical status literals for the `heartbeat_runs.status` column. Exported
+ * here (next to the schema) so every downstream consumer — the heartbeat
+ * service, the delegation poller, tests, API projections — reads from one
+ * source of truth.
+ *
+ * Previously each caller inlined its own literal set, and they drifted: the
+ * delegation poller checked for `"done"` while the schema actually writes
+ * `"succeeded"`, so `delegate_task` never detected child completion and spun
+ * to timeout. Keep these constants authoritative; add here first if the set
+ * ever changes.
+ */
+export const HEARTBEAT_RUN_EXECUTION_PATH_STATUSES = [
+  "queued",
+  "running",
+  "scheduled_retry",
+] as const;
+
+export const HEARTBEAT_RUN_CANCELLABLE_STATUSES = [
+  "queued",
+  "running",
+  "scheduled_retry",
+] as const;
+
+export const HEARTBEAT_RUN_TERMINAL_STATUSES = [
+  "succeeded",
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+
+export const HEARTBEAT_RUN_UNSUCCESSFUL_TERMINAL_STATUSES = [
+  "failed",
+  "cancelled",
+  "timed_out",
+] as const;
+
+export type HeartbeatRunTerminalStatus =
+  (typeof HEARTBEAT_RUN_TERMINAL_STATUSES)[number];
+
 export const heartbeatRuns = pgTable(
   "heartbeat_runs",
   {
