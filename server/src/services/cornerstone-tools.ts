@@ -13,7 +13,12 @@ import { secretService } from "./secrets.js";
 
 export const DEFAULT_CORNERSTONE_API_BASE_URL =
   "https://cornerstone-api-lymgtgeena-nw.a.run.app";
-export const AI_OPS_WRITE_WORKSPACE = "ai-ops";
+// Canonical Cornerstone workspace name is `aiops` (no hyphen — verified via
+// GET /admin/namespaces 2026-04-24: actual workspace rows are `aiops`,
+// `default`, `usefulmachines`, `testworkspace`, `suzannah`). Earlier planning
+// docs use the hyphenated `ai-ops` form; that doesn't match the row and will
+// 403 namespace_not_granted.
+export const AI_OPS_WRITE_WORKSPACE = "aiops";
 export const CORNERSTONE_API_KEY_SECRET_NAME = "CORNERSTONE_API_KEY";
 
 // ---------------------------------------------------------------------------
@@ -52,7 +57,7 @@ export const CORNERSTONE_TOOL_NAMES: readonly CornerstoneToolName[] = [
 // the agent can report it cleanly without retrying.
 const BLOCKED_TOOLS: ReadonlySet<CornerstoneToolName> = new Set(["steward_apply"]);
 
-// Write tools always get their namespace forced to ai-ops regardless of what
+// Write tools always get their namespace forced to aiops regardless of what
 // the agent passes. Per-agent attribution is carried via key prefix
 // conventions (donald_audit_, alan_investigation_, etc.), not namespace.
 const WRITE_TOOLS: ReadonlySet<CornerstoneToolName> = new Set([
@@ -355,7 +360,7 @@ export function createCornerstoneToolsCallback(
   }
 
   // -------------------------------------------------------------------------
-  // Write tools (namespace forced to ai-ops)
+  // Write tools (namespace forced to aiops)
   // -------------------------------------------------------------------------
 
   async function handleAddFact(input: Record<string, unknown>): Promise<CornerstoneToolResult> {
@@ -450,7 +455,7 @@ export function createCornerstoneToolsCallback(
         `steward_preview does not support operation \`${operation}\`. Supported: ${Object.keys(STEWARD_PREVIEW_OPERATIONS).join(", ")}`,
       );
     }
-    // Preview is a write-scope tool: namespace forced to ai-ops regardless of input.
+    // Preview is a write-scope tool: namespace forced to aiops regardless of input.
     const body = buildStewardRequestBody(input, AI_OPS_WRITE_WORKSPACE);
     const res = await callApi("POST", path, { body });
     if (!res.ok) {

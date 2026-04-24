@@ -32,7 +32,7 @@ export function isCornerstoneToolName(name: string): name is CornerstoneToolName
 //
 // Write tools (add_fact, save_conversation, steward_preview, steward_apply)
 // still accept `namespace` in their schema for shape parity with read tools,
-// but the handler forces namespace to `ai-ops` regardless — per-agent
+// but the handler forces namespace to `aiops` regardless — per-agent
 // attribution is carried via key prefix conventions, not namespace.
 // ---------------------------------------------------------------------------
 
@@ -85,7 +85,7 @@ function getContextSpec(): MaCustomToolSpec {
         namespace: {
           type: "string",
           description:
-            "Optional workspace to scope retrieval. Omit to search the default (ai-ops).",
+            "Optional workspace to scope retrieval. Omit to search the default (aiops).",
         },
         detail_level: {
           type: "string",
@@ -196,7 +196,7 @@ function addFactSpec(): MaCustomToolSpec {
   return {
     name: "add_fact",
     description:
-      "Record a discrete, stable, referenceable fact to Cornerstone (always written to the ai-ops workspace). Facts must be atomic (one topic), objectively true or user-confirmed, and under ~200 tokens. Use descriptive key conventions (e.g. 'co_paperclip_<topic>').",
+      "Record a discrete, stable, referenceable fact to Cornerstone (always written to the aiops workspace). Facts must be atomic (one topic), objectively true or user-confirmed, and under ~200 tokens. Use descriptive key conventions (e.g. 'co_paperclip_<topic>').",
     input_schema: {
       type: "object",
       properties: {
@@ -227,7 +227,7 @@ function saveConversationSpec(): MaCustomToolSpec {
   return {
     name: "save_conversation",
     description:
-      "Persist a business-relevant exchange (decision, debugging session, planning) to Cornerstone (always ai-ops). Captures the WHY behind decisions. Do not save personal/off-topic chatter. Pass descriptive `topic`, not 'conversation about stuff'.",
+      "Persist a business-relevant exchange (decision, debugging session, planning) to Cornerstone (always aiops). Captures the WHY behind decisions. Do not save personal/off-topic chatter. Pass descriptive `topic`, not 'conversation about stuff'.",
     input_schema: {
       type: "object",
       properties: {
@@ -308,7 +308,7 @@ function stewardPreviewSpec(): MaCustomToolSpec {
   return {
     name: "steward_preview",
     description:
-      "Dry-run a mutating steward operation against the ai-ops workspace. Returns the exact changes that would be applied by steward_apply, without touching memory. Safe to call; namespace is always forced to ai-ops.",
+      "Dry-run a mutating steward operation against the aiops workspace. Returns the exact changes that would be applied by steward_apply, without touching memory. Safe to call; namespace is always forced to aiops.",
     input_schema: {
       type: "object",
       properties: {

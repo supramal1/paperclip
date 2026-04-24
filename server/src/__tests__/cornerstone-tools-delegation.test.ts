@@ -185,7 +185,7 @@ describe("adapter managed-agents — Cornerstone tools + delegation", () => {
         input: {
           assignee_agent_name: "Donald",
           title: "Audit duplicates",
-          description: "Inspect for duplicate facts in ai-ops",
+          description: "Inspect for duplicate facts in aiops",
           wait: true,
         },
       },
