@@ -425,10 +425,10 @@ export async function execute(
   const delegateTask = ctx.delegateTask;
   const onCustomTool: CustomToolHandler | undefined = delegateTask
     ? async (ev: MaEvent) => {
-        // The MA API delivers tool-use details either as flat fields on the
-        // event (tool_use_id / name / input) or embedded in a content block
-        // with shape {type:"tool_use", id, name, input}. Read both shapes.
-        const flatToolUseId = typeof ev.tool_use_id === "string" ? ev.tool_use_id : null;
+        // On agent.custom_tool_use, the event's own `id` is the tool_use_id
+        // (no separate tool_use_id field exists). name/input are flat on the
+        // event. Also tolerate the content-block shape
+        // {type:"tool_use", id, name, input} for forward compat.
         const flatName = typeof ev.name === "string" ? ev.name : null;
         const flatInput = ev.input;
         const contentBlocks = Array.isArray(ev.content) ? ev.content : [];
@@ -436,6 +436,12 @@ export async function execute(
           (c): c is { type: string; id?: string; name?: string; input?: unknown } =>
             !!c && typeof c === "object" && (c as { type?: unknown }).type === "tool_use",
         );
+        const flatToolUseId =
+          typeof ev.tool_use_id === "string"
+            ? ev.tool_use_id
+            : typeof ev.id === "string" && ev.type === "agent.custom_tool_use"
+              ? ev.id
+              : null;
         const toolUseId =
           flatToolUseId ?? (toolBlock && typeof toolBlock.id === "string" ? toolBlock.id : null);
         const name =
