@@ -3,6 +3,7 @@ import type {
   AdapterExecutionResult,
   DelegationRequest,
 } from "@paperclipai/adapter-utils";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import {
   createAgent,
   createEnvironment,
@@ -286,12 +287,19 @@ export async function execute(
   );
 
   // Task body comes in via ctx.context.taskBody per paperclip convention.
+  // For issue_assigned / comment-driven wakeups the harness does not populate
+  // taskBody directly — it provides ctx.context.paperclipWake which every
+  // other adapter renders via renderPaperclipWakePrompt. Fall back to that so
+  // managed_agents runs on assignment wakeups behave like the others.
   const taskCtx = ctx.context as Record<string, unknown>;
-  const taskBody =
+  const explicitTaskBody =
     readString(taskCtx.taskBody) ??
     readString(taskCtx.body) ??
-    readString(taskCtx.prompt) ??
-    "";
+    readString(taskCtx.prompt);
+  const wakePrompt = renderPaperclipWakePrompt(taskCtx.paperclipWake, {
+    resumedSession: Boolean(readString((ctx.runtime.sessionParams ?? {}).sessionId)),
+  });
+  const taskBody = explicitTaskBody ?? (wakePrompt.trim().length > 0 ? wakePrompt : "");
   const taskKey = readString(taskCtx.taskKey) ?? ctx.runtime.taskKey ?? null;
 
   if (!taskBody) {
@@ -300,7 +308,7 @@ export async function execute(
       signal: null,
       timedOut: false,
       errorCode: "MISSING_TASK_BODY",
-      errorMessage: "ctx.context did not include a taskBody / body / prompt",
+      errorMessage: "ctx.context did not include a taskBody / body / prompt / paperclipWake",
     };
   }
 
