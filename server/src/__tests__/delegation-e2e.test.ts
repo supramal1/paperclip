@@ -5,7 +5,6 @@ import {
   agents,
   companies,
   createDb,
-  heartbeatRuns,
   issues,
   type Db,
 } from "@paperclipai/db";
@@ -103,11 +102,6 @@ async function seedDelegationCompany(db: Db): Promise<SeededCompany> {
     unrelatedAgent: { id: unrelatedId, name: "Unrelated" },
     childNoDelegate: { id: childNoDelId, name: "Child Without Delegate", permissions: { canDelegate: false } },
   };
-}
-
-async function cleanupCompany(db: Db, companyId: string) {
-  await db.delete(agents).where(eq(agents.companyId, companyId));
-  await db.delete(companies).where(eq(companies.id, companyId));
 }
 
 describeUnit("delegation — unit", () => {
@@ -239,145 +233,50 @@ describeUnit("delegation — unit", () => {
 });
 
 // -----------------------------------------------------------------------------
-// E2E tests (1, 5, 6) — behind PAPERCLIP_E2E=1. Require:
-//   - live paperclip dev server (default http://localhost:3100)
-//   - DATABASE_URL pointing at the same DB the server writes to
-//   - server configured with ANTHROPIC_API_KEY + managed-agents beta access
+// E2E scenarios (Tests 1, 5, 6) — DEFERRED. Scaffolded behind PAPERCLIP_E2E=1
+// but intentionally kept as .skip until a future sprint.
+//
+// Why deferred (context from Phase 0D on 2026-04-24):
+//   The running local dev server (`localhost:3100`) was built before the
+//   managed-agents adapter package existed in the tree (it was untracked
+//   spike work until commit c962fa4 landed on branch phase-0-delegation).
+//   `GET /api/adapters` on that server returns 10 adapters; `managed_agents`
+//   is not among them, so agent creation via `POST /api/companies/:id/agents`
+//   rejects `adapterType: "managed_agents"` with "Unknown adapter type".
+//
+//   Rather than rebuild + restart the dev server and resolve the remaining
+//   harness gaps in-session (DATABASE_URL plumbing for embedded-postgres,
+//   parent heartbeat_run id resolution from issue creation response), we
+//   chose to close Phase 0D with the three unit tests above (all green) and
+//   make the end-to-end delegation run the smoke step for Phase 0E — i.e.
+//   it runs once against the freshly deployed Cloud Run revision, where the
+//   new adapter is guaranteed present and env is already wired.
+//
+// To implement in a future sprint, the three gaps to resolve are:
+//   (a) Live dev server with managed_agents in its adapter registry (rebuild
+//       on phase-0-delegation or later)
+//   (b) DATABASE_URL exported in the test process, pointing at the same DB
+//       the server writes to (embedded-postgres requires reading the paperclip
+//       config for the connection string)
+//   (c) Parent heartbeat_run id resolution — issue creation returns issue.id
+//       but not the run id; needs either API extension or a DB lookup via
+//       `heartbeat_runs.contextSnapshot->>'issueId' = :issueId`
 // -----------------------------------------------------------------------------
-const E2E_ENABLED = process.env.PAPERCLIP_E2E === "1";
-const describeE2E = E2E_ENABLED ? describe : describe.skip;
-const BASE_URL = (process.env.PAPERCLIP_E2E_BASE_URL ?? "http://localhost:3100").replace(/\/+$/, "");
-const E2E_DATABASE_URL = process.env.DATABASE_URL ?? process.env.PAPERCLIP_E2E_DATABASE_URL ?? null;
-
-async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+describe.skip("delegation — e2e (deferred)", () => {
+  it.skip("Test 1 — basic sync delegation round-trip (deferred)", () => {
+    // Parent CEO delegates to a direct report with waitForCompletion=true;
+    // expect status="completed", finalText set, child.parent_run_id = parent.id,
+    // costUsd > 0.
   });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`POST ${path} ${res.status}: ${text.slice(0, 300)}`);
-  }
-  return (await res.json()) as T;
-}
 
-async function apiDelete(path: string): Promise<void> {
-  const res = await fetch(`${BASE_URL}${path}`, { method: "DELETE" });
-  if (!res.ok && res.status !== 404) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`DELETE ${path} ${res.status}: ${text.slice(0, 300)}`);
-  }
-}
+  it.skip("Test 5 — timeout characterization (deferred)", () => {
+    // Short timeoutSeconds should yield status="timeout", errorCode="timeout";
+    // child run should still complete independently (not cancelled by the
+    // parent's timeout).
+  });
 
-async function pollRun(
-  db: Db,
-  runId: string,
-  predicate: (row: typeof heartbeatRuns.$inferSelect) => boolean,
-  timeoutMs: number,
-): Promise<typeof heartbeatRuns.$inferSelect | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const row = await db
-      .select()
-      .from(heartbeatRuns)
-      .where(eq(heartbeatRuns.id, runId))
-      .then((rows) => rows[0] ?? null);
-    if (row && predicate(row)) return row;
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  return null;
-}
-
-describeE2E("delegation — e2e (live server)", () => {
-  let db: Db;
-  const createdCompanyIds: string[] = [];
-
-  beforeAll(async () => {
-    if (!E2E_DATABASE_URL) {
-      throw new Error(
-        "PAPERCLIP_E2E=1 requires DATABASE_URL (pointing at the dev server's DB) for heartbeat_run assertions.",
-      );
-    }
-    db = createDb(E2E_DATABASE_URL);
-
-    const health = await fetch(`${BASE_URL}/api/health`).then((r) => r.json()).catch(() => null);
-    if (!health) throw new Error(`Cannot reach ${BASE_URL}/api/health — is the dev server running?`);
-  }, 30_000);
-
-  afterAll(async () => {
-    for (const companyId of createdCompanyIds) {
-      await apiDelete(`/api/companies/${companyId}`).catch(() => undefined);
-    }
-  }, 60_000);
-
-  async function provisionCompany(): Promise<{ companyId: string; parentId: string; reportId: string }> {
-    const nonce = randomUUID().slice(0, 8);
-    const company = await apiPost<{ id: string }>("/api/companies", {
-      name: `delegation-test-${nonce}`,
-    });
-    createdCompanyIds.push(company.id);
-
-    const parent = await apiPost<{ id: string }>(`/api/companies/${company.id}/agents`, {
-      name: "CEO",
-      role: "ceo",
-      adapterType: "managed_agents",
-      adapterConfig: { model: "claude-sonnet-4-6" },
-      permissions: { canDelegate: true },
-    });
-    const report = await apiPost<{ id: string }>(`/api/companies/${company.id}/agents`, {
-      name: "Direct Report",
-      role: "general",
-      reportsTo: parent.id,
-      adapterType: "managed_agents",
-      adapterConfig: { model: "claude-sonnet-4-6" },
-      permissions: { canDelegate: false },
-    });
-
-    return { companyId: company.id, parentId: parent.id, reportId: report.id };
-  }
-
-  // -------------------------------------------------------------------------
-  // Test 1 — Basic sync delegation. Parent CEO delegates to a direct report
-  // with waitForCompletion=true; expect status="completed", finalText set,
-  // child.parent_run_id = parent.id, costUsd > 0.
-  // -------------------------------------------------------------------------
-  it("Test 1 — basic sync delegation round-trip", async () => {
-    const { companyId, parentId } = await provisionCompany();
-    const issue = await apiPost<{ id: string }>(`/api/companies/${companyId}/issues`, {
-      title: "Parent: delegate 'say hello' to your direct report",
-      description:
-        'Call delegate_task with assigneeAgentName="Direct Report", title="say hello", ' +
-        'description="respond with the word hello", waitForCompletion=true, timeoutSeconds=180. ' +
-        "Then end your turn.",
-      assigneeAgentId: parentId,
-    });
-
-    const parentRunRow = await pollRun(
-      db,
-      // TODO: resolve initial parent run id via issue.executionRunId once API returns it
-      issue.id,
-      (r) => r.status === "done" || r.status === "failed",
-      300_000,
-    );
-    expect(parentRunRow, "parent run should reach terminal status").not.toBeNull();
-    // Assertions on childRun.parent_run_id + costUsd added once parentRunRow.id known.
-  }, 360_000);
-
-  // -------------------------------------------------------------------------
-  // Test 5 — Timeout characterization. Short timeoutSeconds should yield
-  // status="timeout", errorCode="timeout"; child run should still complete
-  // independently (not cancelled by the parent's timeout).
-  // -------------------------------------------------------------------------
-  it.skip("Test 5 — timeout characterization (scaffolded, needs parent-run-id plumbing)", async () => {
-    expect(true).toBe(true);
-  }, 360_000);
-
-  // -------------------------------------------------------------------------
-  // Test 6 — waitForCompletion=false. Tool returns immediately with
-  // status="queued", childRunId populated, finalText=null, costUsd=null.
-  // -------------------------------------------------------------------------
-  it.skip("Test 6 — waitForCompletion=false returns queued (scaffolded)", async () => {
-    expect(true).toBe(true);
-  }, 120_000);
+  it.skip("Test 6 — waitForCompletion=false (deferred)", () => {
+    // Tool returns immediately with status="queued", childRunId populated,
+    // finalText=null, costUsd=null.
+  });
 });
