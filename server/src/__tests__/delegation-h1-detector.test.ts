@@ -758,4 +758,215 @@ describe("adapter managed-agents — H1 detector", () => {
       mock.restore();
     }
   }, 20_000);
+
+  // ---------------------------------------------------------------------------
+  // Bug 5 regression — parallel tool_use blocks must NOT trigger H1
+  //
+  // Context (2026-04-25, Donald sessions on paperclip-workforce-00037-6kr):
+  //   Three Donald audit sessions completed cleanly (stopReason=end_turn,
+  //   maSessionStatus=idle, all API calls 200) but were flagged isError=true
+  //   because spanCount=3, customToolUseCount=3 → 3 < 3+1 false-positives the
+  //   old H1 invariant. The Anthropic Messages API permits a single assistant
+  //   turn to emit multiple tool_use blocks in parallel — counting raw events
+  //   over-counts.
+  //
+  // The fix (execute.ts:792 area): count distinct *tool-emitting spans*, not
+  // raw tool_use events. The new invariant is spanCount >= toolUseSpanCount + 1.
+  //
+  // This test scripts a session where one model span emits TWO parallel
+  // tool_use blocks, both tools resolve, then a synthesis span produces the
+  // final text. spanCount=2, customToolUseCount=2, toolUseSpanCount=1.
+  // Old detector: 2 < 2+1 → H1 (false positive). New detector: 2 >= 1+1 → ok.
+  // ---------------------------------------------------------------------------
+  it("does not flag parallel tool_use blocks within a single span", async () => {
+    const SESSION_ID = "sesn_test_parallel_tools";
+    const AGENT_ID = "agnt_parallel";
+    const ENV_ID = "envr_parallel";
+    const TOOL_USE_ID_A = "sevt_tool_use_parallel_a";
+    const TOOL_USE_ID_B = "sevt_tool_use_parallel_b";
+
+    // Pre-tool-result events: ONE span end, then TWO parallel tool_use
+    // events emitted by that span, then status_idle{tool_use}.
+    const preEvents: MaEventStub[] = [
+      {
+        id: "sevt_span_pre",
+        type: "span.model_request_end",
+        model_usage: {
+          input_tokens: 3,
+          output_tokens: 200,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 19300,
+        },
+      },
+      {
+        id: "sevt_msg_pre",
+        type: "agent.message",
+        content: [{ type: "text", text: "I'll fetch context and search in parallel." }],
+      },
+      {
+        id: TOOL_USE_ID_A,
+        type: "agent.custom_tool_use",
+        name: "delegate_task",
+        input: {
+          assignee_agent_name: "Donald",
+          title: "branch a",
+          description: "first parallel call",
+          wait: true,
+        },
+      },
+      {
+        id: TOOL_USE_ID_B,
+        type: "agent.custom_tool_use",
+        name: "delegate_task",
+        input: {
+          assignee_agent_name: "Donald",
+          title: "branch b",
+          description: "second parallel call",
+          wait: true,
+        },
+      },
+      {
+        id: "sevt_idle_pre",
+        type: "session.status_idle",
+        stop_reason: { type: "tool_use" },
+      },
+    ];
+
+    let toolResultsPosted = 0;
+
+    const mock = installMaFetch((method, path, body) => {
+      if (method === "POST" && path === "/v1/agents") {
+        return {
+          status: 200,
+          body: {
+            id: AGENT_ID,
+            version: 1,
+            model: { id: "claude-haiku-4-5-20251001" },
+            name: "t",
+            system: "",
+          },
+        };
+      }
+      if (method === "POST" && path === "/v1/environments") {
+        return { status: 200, body: { id: ENV_ID, state: "r", name: "t" } };
+      }
+      if (method === "POST" && path === "/v1/sessions") {
+        return {
+          status: 200,
+          body: {
+            id: SESSION_ID,
+            status: "running",
+            environment_id: ENV_ID,
+            agent: { id: AGENT_ID, version: 1 },
+            usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 },
+            stats: { active_seconds: 0, duration_seconds: 0 },
+          },
+        };
+      }
+      if (method === "POST" && path === `/v1/sessions/${SESSION_ID}/events`) {
+        const rec = body as { events?: Array<Record<string, unknown>> } | null;
+        const ev = rec?.events?.[0];
+        if (ev?.type === "user.custom_tool_result") {
+          toolResultsPosted += 1;
+        }
+        return { status: 200, body: { data: [] } };
+      }
+      if (method === "GET" && path === `/v1/sessions/${SESSION_ID}/events`) {
+        if (toolResultsPosted < 2) {
+          return { status: 200, body: { data: preEvents } };
+        }
+        // Both tool_results posted → single synthesis span produces final text.
+        return {
+          status: 200,
+          body: {
+            data: [
+              ...preEvents,
+              {
+                id: "sevt_tool_result_a",
+                type: "user.custom_tool_result",
+                custom_tool_use_id: TOOL_USE_ID_A,
+              },
+              {
+                id: "sevt_tool_result_b",
+                type: "user.custom_tool_result",
+                custom_tool_use_id: TOOL_USE_ID_B,
+              },
+              {
+                id: "sevt_span_synthesis",
+                type: "span.model_request_end",
+                model_usage: {
+                  input_tokens: 5,
+                  output_tokens: 800,
+                  cache_read_input_tokens: 19300,
+                  cache_creation_input_tokens: 0,
+                },
+              },
+              {
+                id: "sevt_msg_synthesis",
+                type: "agent.message",
+                content: [
+                  { type: "text", text: "Synthesis after parallel tool calls." },
+                ],
+              },
+              {
+                id: "sevt_idle_end",
+                type: "session.status_idle",
+                stop_reason: { type: "end_turn" },
+              },
+            ],
+          },
+        };
+      }
+      if (method === "GET" && path === `/v1/sessions/${SESSION_ID}`) {
+        return {
+          status: 200,
+          body: {
+            id: SESSION_ID,
+            status: "idle",
+            environment_id: ENV_ID,
+            agent: { id: AGENT_ID, version: 1 },
+            usage: { input_tokens: 8, output_tokens: 1000, cache_read_input_tokens: 19300 },
+            stats: { active_seconds: 28, duration_seconds: 35 },
+          },
+        };
+      }
+      return { status: 404, body: { error: `unmocked ${method} ${path}` } };
+    });
+
+    let delegateCalls = 0;
+    const delegateTask = async (): Promise<DelegationResult> => {
+      delegateCalls += 1;
+      return {
+        status: "completed",
+        childRunId: `c-${delegateCalls}`,
+        childIssueId: "i",
+        childIssueIdentifier: `X-${delegateCalls}`,
+        finalText: `branch ${delegateCalls} output`,
+        costUsd: 0.1,
+        errorCode: null,
+        errorMessage: null,
+      };
+    };
+
+    try {
+      const result = await execute(
+        buildCtx({ runId: "parallel-tools-run", delegateTask }),
+      );
+      // Both parallel tools dispatched.
+      expect(delegateCalls).toBe(2);
+      expect(toolResultsPosted).toBe(2);
+      // Synthesis ran, no H1 false positive.
+      expect(result.exitCode).toBe(0);
+      expect(result.errorCode ?? null).toBeNull();
+      const rj = result.resultJson as Record<string, unknown> | undefined;
+      // Counts recorded for diagnostics.
+      expect(rj?.customToolUseCount).toBe(2);
+      expect(rj?.toolUseSpanCount).toBe(1);
+      expect(rj?.spanCount).toBe(2);
+      expect(rj?.h1Detected).toBe(false);
+      expect(rj?.finalText as string).toContain("Synthesis after parallel");
+    } finally {
+      mock.restore();
+    }
+  }, 20_000);
 });

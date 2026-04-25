@@ -622,7 +622,7 @@ export async function execute(
   // tool name: delegate_task → delegateTask callback; the 11 Cornerstone
   // tools → cornerstoneTools callback. Unknown tools post a structured error.
   // Keeping one path preserves the H1 invariant (spanCount >=
-  // customToolUseCount + 1) across mixed tool use in a single session.
+  // toolUseSpanCount + 1) across mixed tool use in a single session.
   const customToolBound = Boolean(delegateTask) || Boolean(cornerstoneTools);
   const onCustomTool: CustomToolHandler | undefined = customToolBound
     ? async (ev: MaEvent) => {
@@ -791,6 +791,13 @@ export async function execute(
   let stopReason: string | null = null;
   let spanCount = 0;
   let customToolUseCount = 0;
+  // toolUseSpanCount counts distinct spans that emitted at least one
+  // agent.custom_tool_use event. This is the right unit for the H1
+  // invariant: parallel tool_use blocks land in a single model turn, so
+  // counting events overcounts and produces false positives when the
+  // model batches calls. See Bug 5 (2026-04-25).
+  let toolUseSpanCount = 0;
+  let toolUseInCurrentSpan = false;
 
   for (const ev of newEvents) {
     if (ev.type === "span.model_request_end" && ev.model_usage) {
@@ -800,9 +807,16 @@ export async function execute(
       cacheCreateTokens += ev.model_usage.cache_creation_input_tokens;
       if (ev.is_error) isError = true;
       spanCount += 1;
+      // If the just-ended span had any tool_use events attributed to it
+      // (events streamed before the next span boundary), credit it once.
+      if (toolUseInCurrentSpan) {
+        toolUseSpanCount += 1;
+        toolUseInCurrentSpan = false;
+      }
     }
     if (ev.type === "agent.custom_tool_use") {
       customToolUseCount += 1;
+      toolUseInCurrentSpan = true;
     }
     if (ev.type === "agent.message" && ev.content) {
       const text = ev.content.filter((c) => c.type === "text").map((c) => c.text ?? "").join("");
@@ -812,6 +826,11 @@ export async function execute(
       stopReason = ev.stop_reason.type;
     }
   }
+  // Tail handling: tool_use events emitted AFTER the last span boundary
+  // (still associated with that span) — credit the trailing span once.
+  if (toolUseInCurrentSpan) {
+    toolUseSpanCount += 1;
+  }
 
   // Pull final session state for runtime cost
   const finalSession = await getSession(apiKey, sessionId);
@@ -820,31 +839,34 @@ export async function execute(
   // -------------------------------------------------------------------------
   // H1 detector — "session terminated before tool_result"
   //
-  // Invariant: every agent.custom_tool_use event should be followed by a
-  // subsequent span.model_request_end (the synthesis turn where the model
-  // reads the posted tool_result and produces its next output). So the total
-  // span count must be >= customToolUseCount + 1 (one span emitted the tool_use
-  // itself, plus one synthesis span per tool_result).
+  // Invariant: each span that emits at least one agent.custom_tool_use must
+  // be followed by a subsequent span.model_request_end (the synthesis turn
+  // where the model reads the posted tool_result(s) and produces its next
+  // output). The total span count must be >= toolUseSpanCount + 1 (each
+  // tool-emitting span plus one final synthesis span).
   //
-  // When spans < customToolUseCount + 1, MA emitted the tool_use but never
-  // ran the synthesis turn. We observed this in Ada's run 5fc47c80 on
+  // We count distinct *tool-emitting spans*, not raw tool_use events. The
+  // Anthropic Messages API permits a single assistant turn to emit multiple
+  // tool_use blocks in parallel; counting events would over-count and
+  // false-positive every parallel-call session (Bug 5, observed 2026-04-25
+  // on Donald sessions sesn_011CaPWrMV9U4orvGSULHump etc — spanCount=3,
+  // customToolUseCount=4, stopReason=end_turn, but old detector flagged H1).
+  //
+  // When spanCount < toolUseSpanCount + 1, MA emitted tool_use(s) but never
+  // ran the synthesis turn — first observed in Ada's run 5fc47c80 on
   // 2026-04-24: cacheReadTokens=0 at run-end proved no second API call
-  // happened. finalText stayed at her pre-delegation preamble. Prior to this
-  // check, the adapter classified such runs as success (exitCode=0) because
-  // no explicit API error fired — hiding the failure from every downstream
-  // system.
+  // happened. finalText stayed at her pre-delegation preamble. Prior to
+  // this check, the adapter classified such runs as success (exitCode=0)
+  // because no explicit API error fired — hiding the failure from every
+  // downstream system.
   //
   // Classify as error so: (a) heartbeat_run is marked failed, (b) the
   // reconciler can retry with backoff instead of silently stalling, (c)
   // errorMeta lands the diagnostic fields as structured JSON in Cloud
   // Logging so operators can filter by errorCode without string-parsing.
-  //
-  // Run-end placement (not per-waitForIdle-iteration) — H1 can manifest at
-  // the loop exit or after the final status check, so operating against the
-  // aggregated event stream handles both in-flight and post-hoc termination.
   // -------------------------------------------------------------------------
-  const expectedMinSpans = customToolUseCount + 1;
-  const h1Detected = customToolUseCount > 0 && spanCount < expectedMinSpans;
+  const expectedMinSpans = toolUseSpanCount + 1;
+  const h1Detected = toolUseSpanCount > 0 && spanCount < expectedMinSpans;
   let h1ErrorCode: string | null = null;
   let h1ErrorMessage: string | null = null;
   let h1ErrorMeta: Record<string, unknown> | null = null;
@@ -852,7 +874,8 @@ export async function execute(
     isError = true;
     h1ErrorCode = "session_terminated_before_tool_result";
     h1ErrorMessage =
-      `MA session did not resume after ${customToolUseCount} tool_result post(s). ` +
+      `MA session did not resume after ${toolUseSpanCount} tool-emitting span(s) ` +
+      `(${customToolUseCount} tool_use event(s)). ` +
       `Observed ${spanCount} model span(s), expected ≥ ${expectedMinSpans}.`;
     h1ErrorMeta = {
       sessionId,
@@ -860,6 +883,7 @@ export async function execute(
       companyId: ctx.agent.companyId,
       paperclipAgentId: ctx.agent.id,
       customToolUseCount,
+      toolUseSpanCount,
       spanCount,
       expectedMinSpans,
       cacheReadTokens,
@@ -884,6 +908,7 @@ export async function execute(
       newEventCount: newEvents.length,
       spanCount,
       customToolUseCount,
+      toolUseSpanCount,
       h1Detected,
       isError,
       maSessionStatus: finalSession.status,
@@ -934,6 +959,7 @@ export async function execute(
       finalText,
       spanCount,
       customToolUseCount,
+      toolUseSpanCount,
       h1Detected,
     },
     summary: finalText.slice(0, 280) || null,
