@@ -8,8 +8,10 @@ import {
   costEvents,
   heartbeatRuns,
   HEARTBEAT_RUN_TERMINAL_STATUSES,
+  type HeartbeatRunTerminalStatus,
   type Db,
 } from "@paperclipai/db";
+import type { IssueStatus } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { issueService } from "./issues.js";
 
@@ -19,7 +21,15 @@ import { issueService } from "./issues.js";
 // never writes — so succeeded child runs were never detected and the parent's
 // delegate_task tool_result was never posted.)
 const TERMINAL_STATUSES = new Set<string>(HEARTBEAT_RUN_TERMINAL_STATUSES);
-const SUCCEEDED_STATUS = "succeeded";
+const SUCCEEDED_STATUS = "succeeded" satisfies HeartbeatRunTerminalStatus;
+
+// Issue-status literals sourced from the shared enum so this service can't
+// drift from the canonical set in @paperclipai/shared. The `satisfies` clause
+// makes the typecheck fail if any of these literals is ever removed from
+// ISSUE_STATUSES upstream — that's the drift protection we want.
+const ISSUE_STATUS_TODO = "todo" satisfies IssueStatus;
+const ISSUE_STATUS_DONE = "done" satisfies IssueStatus;
+const ISSUE_STATUS_CANCELLED = "cancelled" satisfies IssueStatus;
 
 interface DelegationDeps {
   db: Db;
@@ -155,7 +165,7 @@ export function createDelegateTaskCallback(
       issue = await svc.create(parentAgent.companyId, {
         title: titleTrimmed,
         description: req.description,
-        status: "todo",
+        status: ISSUE_STATUS_TODO,
         priority: "medium",
         assigneeAgentId: assignee.id,
         createdByAgentId: parentAgent.id,
@@ -265,7 +275,7 @@ export function createDelegateTaskCallback(
       // Flip the issue to cancelled so the reconciler doesn't keep waking the
       // assignee forever on a task its parent already gave up on.
       try {
-        await svc.update(issue.id, { status: "cancelled" });
+        await svc.update(issue.id, { status: ISSUE_STATUS_CANCELLED });
       } catch (err) {
         logger.warn(
           { err: err instanceof Error ? err.message : String(err), issueId: issue.id },
@@ -295,7 +305,7 @@ export function createDelegateTaskCallback(
     // stops re-waking the assignee via issue.continuation_recovery. Succeeded
     // → done; anything else (failed / cancelled / timed_out) → cancelled so
     // the parent owns reassignment via the tool_result it's about to receive.
-    const nextIssueStatus = succeeded ? "done" : "cancelled";
+    const nextIssueStatus = succeeded ? ISSUE_STATUS_DONE : ISSUE_STATUS_CANCELLED;
     try {
       await svc.update(issue.id, { status: nextIssueStatus });
     } catch (err) {

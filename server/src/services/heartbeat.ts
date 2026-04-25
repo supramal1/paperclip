@@ -6255,7 +6255,9 @@ export function heartbeatService(db: Db) {
         (issue.status === "todo" || issue.status === "in_progress") &&
         !issue.assigneeUserId &&
         issue.assigneeAgentId === run.agentId &&
-        (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled");
+        UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES.includes(
+          run.status as (typeof UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES)[number],
+        );
 
       if (!issueNeedsImmediateRecovery) {
         return { kind: "released" as const };
