@@ -1847,6 +1847,13 @@ export function heartbeatService(db: Db) {
   const executionWorkspacesSvc = executionWorkspaceService(db);
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  // In-process adapters (e.g. managed_agents) cannot be cancelled via SIGTERM
+  // because they don't fork a child process. Instead, we register an
+  // AbortController per run before invoking adapter.execute(...) and pass its
+  // signal through ctx.abortSignal. cancelRunInternal aborts the controller so
+  // adapters that honour the signal exit promptly. The map is cleaned up in
+  // the run-loop finally block regardless of outcome.
+  const runAbortControllers = new Map<string, AbortController>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -5491,6 +5498,8 @@ export function heartbeatService(db: Db) {
               permissions: agentPermissions,
             },
             parentRunId: run.id,
+            cancelRun: (childRunId, reason) =>
+              cancelRunInternal(childRunId, reason ?? "Cancelled by parent delegation timeout").then(() => undefined),
           })
         : undefined;
       // canUseCornerstone gate mirrors the canDelegate pattern. Any adapter
@@ -5504,6 +5513,12 @@ export function heartbeatService(db: Db) {
             companyId: agent.companyId,
           })
         : undefined;
+      // Per-run AbortController for in-process adapters (managed_agents).
+      // Registered before execute() so cancelRunInternal can fire it; cleared
+      // in the run-loop finally block (line ~5874). Process-based adapters
+      // ignore ctx.abortSignal; they keep using SIGTERM via runningProcesses.
+      const runAbortController = new AbortController();
+      runAbortControllers.set(run.id, runAbortController);
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -5525,6 +5540,7 @@ export function heartbeatService(db: Db) {
         authToken: authToken ?? undefined,
         delegateTask,
         cornerstoneTools,
+        abortSignal: runAbortController.signal,
       });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
@@ -5872,6 +5888,7 @@ export function heartbeatService(db: Db) {
         } finally {
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
           activeRunExecutions.delete(run.id);
+          runAbortControllers.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
   }
@@ -6962,6 +6979,19 @@ export function heartbeatService(db: Db) {
     if (!run) throw notFound("Heartbeat run not found");
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
     const agent = await getAgent(run.agentId);
+
+    // Fire the AbortController for in-process adapters (managed_agents).
+    // Process-based adapters ignore the signal; they're terminated via SIGTERM
+    // below. Both branches run unconditionally so a run that's mid-transition
+    // between in-process and child-process state still gets cancelled.
+    const abortController = runAbortControllers.get(run.id);
+    if (abortController && !abortController.signal.aborted) {
+      try {
+        abortController.abort();
+      } catch {
+        /* noop — AbortController.abort() is idempotent in modern runtimes */
+      }
+    }
 
     const running = runningProcesses.get(run.id);
     if (running) {

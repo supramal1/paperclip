@@ -45,6 +45,15 @@ interface DelegationDeps {
     permissions: Record<string, unknown>;
   };
   parentRunId: string;
+  /**
+   * Optional callback invoked when the parent's polling deadline expires
+   * before the child reaches terminal. The callback should cancel the
+   * still-running child heartbeat_run so it doesn't keep billing or post a
+   * tool_result after the parent has already returned status="timeout".
+   * When omitted (e.g. unit tests), timeout still flips the issue to
+   * cancelled but the child run is left to terminate on its own.
+   */
+  cancelRun?: (childRunId: string, reason?: string) => Promise<void>;
 }
 
 function readBoolean(value: unknown): boolean {
@@ -85,6 +94,7 @@ export function createDelegateTaskCallback(
     errorMessage,
   });
 
+  const { cancelRun } = deps;
   return async function delegateTask(req: DelegationRequest): Promise<DelegationResult> {
     // 1. Resolve assignee by name within the same company (case-insensitive).
     const candidates = await db
@@ -233,9 +243,27 @@ export function createDelegateTaskCallback(
     }
 
     if (!childRow || !TERMINAL_STATUSES.has(childRow.status)) {
-      // Child never reached terminal. Flip the issue to cancelled so the
-      // reconciler doesn't keep waking the assignee forever on a task its
-      // parent already gave up on.
+      // Child never reached terminal. Cancel the still-running child run
+      // before flipping the issue, otherwise the orphan keeps polling the
+      // model API (billing the company) and may post a tool_result after the
+      // parent has already returned status="timeout". F-DELEG-4 sibling of
+      // Bug 7 — fixed 2026-04-25.
+      if (cancelRun) {
+        try {
+          await cancelRun(childRunId, "parent_delegation_timeout");
+        } catch (err) {
+          logger.warn(
+            {
+              err: err instanceof Error ? err.message : String(err),
+              childRunId,
+              issueId: issue.id,
+            },
+            "delegation: failed to cancel child run after parent timeout",
+          );
+        }
+      }
+      // Flip the issue to cancelled so the reconciler doesn't keep waking the
+      // assignee forever on a task its parent already gave up on.
       try {
         await svc.update(issue.id, { status: "cancelled" });
       } catch (err) {

@@ -182,6 +182,15 @@ export interface AdapterExecutionContext {
    * custom tool surfaces can ignore it.
    */
   cornerstoneTools?: CornerstoneToolsCallback;
+  /**
+   * Cancellation signal for in-process adapters (e.g. managed_agents) that
+   * cannot be cancelled via SIGTERM. When the heartbeat service cancels a
+   * run, this AbortController is fired so the adapter's polling loops can
+   * exit promptly. Adapters that don't honour it fall back to natural
+   * timeout — the cancel still records correctly in the DB but in-flight
+   * provider calls may continue to bill until they complete.
+   */
+  abortSignal?: AbortSignal;
 }
 
 export interface AdapterModel {

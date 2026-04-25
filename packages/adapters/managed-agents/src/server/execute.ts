@@ -167,6 +167,39 @@ async function fetchSkillBodies(
 // ignored via `seenIds` so they don't falsely terminate the outer loop.
 type CustomToolHandler = (ev: MaEvent) => Promise<void>;
 
+// Sentinel error class so callers can distinguish abort-driven exits from
+// timeout-driven exits without parsing message strings.
+export class WaitForIdleAbortedError extends Error {
+  readonly code = "aborted";
+  constructor(sessionId: string) {
+    super(`Session ${sessionId} polling aborted`);
+    this.name = "WaitForIdleAbortedError";
+  }
+}
+
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal && typeof signal.removeEventListener === "function") {
+        signal.removeEventListener("abort", onAbort);
+      }
+    };
+    if (signal && typeof signal.addEventListener === "function") {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
 async function waitForIdle(
   apiKey: string,
   sessionId: string,
@@ -174,12 +207,25 @@ async function waitForIdle(
   onEvent: (ev: MaEvent) => Promise<void>,
   timeoutMs: number,
   onCustomTool?: CustomToolHandler,
+  abortSignal?: AbortSignal,
 ): Promise<MaEvent[]> {
   const start = Date.now();
   const allNew: MaEvent[] = [];
   let iter = 0;
-  maDbg("waitForIdle_start", { sessionId, timeoutMs, seenIdsAtEntry: seenIds.size });
+  maDbg("waitForIdle_start", { sessionId, timeoutMs, seenIdsAtEntry: seenIds.size, hasAbortSignal: Boolean(abortSignal) });
+  if (abortSignal?.aborted) {
+    throw new WaitForIdleAbortedError(sessionId);
+  }
   while (Date.now() - start < timeoutMs) {
+    if (abortSignal?.aborted) {
+      maDbg("waitForIdle_aborted", {
+        sessionId,
+        iter,
+        totalNewEvents: allNew.length,
+        elapsedMs: Date.now() - start,
+      });
+      throw new WaitForIdleAbortedError(sessionId);
+    }
     iter += 1;
     const cycleStart = Date.now();
     const { data } = await listEvents(apiKey, sessionId);
@@ -284,7 +330,7 @@ async function waitForIdle(
       });
       return allNew;
     }
-    await new Promise((r) => setTimeout(r, 500));
+    await abortableSleep(500, abortSignal);
   }
   maDbg(
     "waitForIdle_timeout",
@@ -393,8 +439,12 @@ export async function execute(
   const model = readString(cfg.model) ?? "claude-haiku-4-5-20251001";
   const namespace = readString(cfg.cornerstoneNamespace) ?? "default";
   const outputFormat = readString(cfg.outputFormat) ?? undefined;
+  // Default raised from 600s → 1800s on 2026-04-25 to support long-running
+  // agent sessions (e.g. Grace's audit work). Cancellation is now handled via
+  // ctx.abortSignal — heartbeat.cancelRunInternal aborts the controller so
+  // operators can stop a run mid-flight without waiting for the natural cap.
   const timeoutSec =
-    typeof cfg.timeoutSec === "number" && cfg.timeoutSec > 0 ? cfg.timeoutSec : 600;
+    typeof cfg.timeoutSec === "number" && cfg.timeoutSec > 0 ? cfg.timeoutSec : 1800;
   const requestedSkillNames = collectRequestedSkillNames(cfg);
   await ctx.onLog(
     "stdout",
@@ -772,14 +822,36 @@ export async function execute(
       }
     : undefined;
 
-  const newEvents = await waitForIdle(
-    apiKey,
-    sessionId,
-    seen,
-    onEvent,
-    timeoutSec * 1000,
-    onCustomTool,
-  );
+  let newEvents: MaEvent[];
+  try {
+    newEvents = await waitForIdle(
+      apiKey,
+      sessionId,
+      seen,
+      onEvent,
+      timeoutSec * 1000,
+      onCustomTool,
+      ctx.abortSignal,
+    );
+  } catch (err) {
+    if (err instanceof WaitForIdleAbortedError) {
+      maDbg(
+        "execute_aborted",
+        { sessionId, runId: ctx.runId, agentId: ctx.agent.id },
+        "WARNING",
+      );
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorCode: "cancelled",
+        errorMessage: "Run cancelled by control plane (abort signal fired)",
+        sessionParams: ctx.runtime.sessionParams,
+        sessionDisplayId: ctx.runtime.sessionDisplayId,
+      };
+    }
+    throw err;
+  }
 
   // Aggregate usage + final response
   let inputTokens = 0;
