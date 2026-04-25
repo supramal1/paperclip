@@ -56,6 +56,15 @@ interface DelegationDeps {
   };
   parentRunId: string;
   /**
+   * Cornerstone targetWorkspace inherited from the parent issue. Propagated
+   * onto the child issue at creation time so the child's tool dispatch
+   * resolves writes to the same namespace as the parent — no agent input,
+   * no env fallback unless the parent itself was unset. Null = parent had
+   * no targetWorkspace; child inherits null and falls through to
+   * AI_OPS_WRITE_WORKSPACE downstream.
+   */
+  parentTargetWorkspace?: string | null;
+  /**
    * Optional callback invoked when the parent's polling deadline expires
    * before the child reaches terminal. The callback should cancel the
    * still-running child heartbeat_run so it doesn't keep billing or post a
@@ -88,7 +97,7 @@ async function sumChildCostCents(db: Db, childRunId: string): Promise<number> {
 export function createDelegateTaskCallback(
   deps: DelegationDeps,
 ): (req: DelegationRequest) => Promise<DelegationResult> {
-  const { db, heartbeat, parentAgent, parentRunId } = deps;
+  const { db, heartbeat, parentAgent, parentRunId, parentTargetWorkspace = null } = deps;
   const blankResult = (
     status: DelegationResult["status"],
     errorCode: string | null,
@@ -171,6 +180,9 @@ export function createDelegateTaskCallback(
         createdByAgentId: parentAgent.id,
         originKind: "delegation",
         originId: parentRunId,
+        // Inherit parent's targetWorkspace verbatim — agent input on the
+        // delegate_task tool can't override this (delegation safety).
+        targetWorkspace: parentTargetWorkspace,
       } as Parameters<typeof svc.create>[1]);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

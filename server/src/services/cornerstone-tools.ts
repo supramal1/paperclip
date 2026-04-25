@@ -77,6 +77,13 @@ export interface CornerstoneToolsDeps {
   // Test hook. Prod path resolves via secretService(db).getByName + latest
   // version decrypt; tests pass a plain string to skip DB wiring.
   apiKeyResolver?: () => Promise<string>;
+  // Per-task Cornerstone namespace inherited from issues.target_workspace.
+  // When set, this overrides the AI_OPS_WRITE_WORKSPACE fallback for both
+  // reads and writes — and on writes, agent-supplied namespace input is
+  // ignored (delegation safety / prompt-injection guard). When null, falls
+  // through to AI_OPS_WRITE_WORKSPACE so the previous global behaviour
+  // remains the default for tasks that haven't been routed yet.
+  targetWorkspace?: string | null;
 }
 
 function isCornerstoneToolName(name: string): name is CornerstoneToolName {
@@ -157,6 +164,12 @@ export function createCornerstoneToolsCallback(
 ): CornerstoneToolsCallback {
   const baseUrl = (deps.apiBaseUrl ?? DEFAULT_CORNERSTONE_API_BASE_URL).replace(/\/+$/, "");
   const doFetch = deps.fetchImpl ?? fetch;
+  // Closure-captured task workspace. Resolved once per heartbeat factory
+  // invocation; null = no per-task routing, fall through to env fallback.
+  const taskWorkspace = deps.targetWorkspace ?? null;
+  // Effective write namespace: task wins over env fallback; agent input is
+  // never consulted on writes regardless of taskWorkspace.
+  const writeNamespace = taskWorkspace ?? AI_OPS_WRITE_WORKSPACE;
 
   let resolveApiKey: () => Promise<string>;
   if (deps.apiKeyResolver) {
@@ -221,6 +234,48 @@ export function createCornerstoneToolsCallback(
     return "Cornerstone API error";
   }
 
+  // Detects the Cornerstone API's namespace-grant rejections. The API returns
+  // 403 with detail strings like "namespace_not_granted" or
+  // "Namespace is required. This principal has multiple workspace grants" —
+  // both indicate the resolved namespace is not authorised for the principal
+  // (or no namespace was resolvable at all). We surface this as a stable
+  // structured code so adapters / agents can react cleanly without parsing
+  // free-text detail.
+  function isNamespaceGrantFailure(status: number, body: unknown): boolean {
+    if (status !== 403) return false;
+    const rec = asRecord(body);
+    const detail = rec
+      ? (rec.detail ?? rec.error ?? rec.message)
+      : typeof body === "string"
+        ? body
+        : null;
+    if (typeof detail !== "string") return false;
+    const lower = detail.toLowerCase();
+    return (
+      lower.includes("namespace_not_granted") ||
+      lower.includes("namespace is required") ||
+      lower.includes("not granted")
+    );
+  }
+
+  function mapApiError(
+    res: { ok: false; status: number; body: unknown },
+    namespace: string | null,
+  ): CornerstoneToolResult {
+    if (isNamespaceGrantFailure(res.status, res.body)) {
+      const ns = namespace ?? writeNamespace;
+      return errorResult(
+        "target_workspace_grant_missing",
+        `Cornerstone principal has no grant for namespace "${ns}". ` +
+          (taskWorkspace
+            ? `This task's targetWorkspace is "${taskWorkspace}" — request a grant for it on this principal, or update issues.target_workspace to a namespace this principal can access.`
+            : `Falling back to AI_OPS_WRITE_WORKSPACE ("${AI_OPS_WRITE_WORKSPACE}"); set issues.target_workspace to a namespace this principal can access.`),
+        res,
+      );
+    }
+    return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+  }
+
   function errorResult(
     code: string,
     message: string,
@@ -252,13 +307,17 @@ export function createCornerstoneToolsCallback(
     const input = asRecord(req.input) ?? {};
     const isWrite = WRITE_TOOLS.has(toolName);
     const namespaceRaw = readOptionalString(input.namespace);
-    // Writes force aiops regardless of input. Reads default to aiops when the
-    // agent omits namespace — Workforce service principals are aiops-scoped,
-    // and an empty namespace round-trips to the API as namespace_required 403.
-    // An agent-supplied read namespace still passes through unchanged.
+    // Resolution rules (Mal's directive 2026-04-25):
+    //   Writes:  taskWorkspace ?? AI_OPS_WRITE_WORKSPACE   (agent IGNORED)
+    //   Reads:   taskWorkspace ?? agentSupplied ?? AI_OPS_WRITE_WORKSPACE
+    // Task wins for delegation safety — agent-supplied namespace via tool
+    // call cannot override a parent task's workspace (closes prompt-injection
+    // hole). For reads, agent input still serves as a useful escape hatch
+    // when the task itself didn't pin a workspace (back-compat for tasks
+    // filed before targetWorkspace existed).
     const namespace = isWrite
-      ? AI_OPS_WRITE_WORKSPACE
-      : (namespaceRaw ?? AI_OPS_WRITE_WORKSPACE);
+      ? writeNamespace
+      : (taskWorkspace ?? namespaceRaw ?? AI_OPS_WRITE_WORKSPACE);
 
     try {
       switch (toolName) {
@@ -313,7 +372,7 @@ export function createCornerstoneToolsCallback(
     };
     const res = await callApi("POST", "/context", { body });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, namespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -332,7 +391,7 @@ export function createCornerstoneToolsCallback(
     };
     const res = await callApi("POST", "/context", { body });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, namespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -351,7 +410,7 @@ export function createCornerstoneToolsCallback(
     if (limit !== null) query.limit = String(Math.max(1, Math.min(limit, 500)));
     const res = await callApi("GET", "/memory/facts", { query });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, namespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -371,7 +430,7 @@ export function createCornerstoneToolsCallback(
     };
     const res = await callApi("POST", "/context", { body });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, namespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -388,13 +447,13 @@ export function createCornerstoneToolsCallback(
     const body: Record<string, unknown> = {
       key,
       value,
-      namespace: AI_OPS_WRITE_WORKSPACE,
+      namespace: writeNamespace,
       category: readOptionalString(input.category) ?? "general",
       confidence: typeof input.confidence === "number" ? input.confidence : 0.9,
     };
     const res = await callApi("POST", "/memory/fact", { body });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, writeNamespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -411,13 +470,13 @@ export function createCornerstoneToolsCallback(
     const body: Record<string, unknown> = {
       topic,
       messages,
-      namespace: AI_OPS_WRITE_WORKSPACE,
+      namespace: writeNamespace,
     };
     const source = readOptionalString(input.source);
     if (source) body.source = source;
     const res = await callApi("POST", "/ingest", { body });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, writeNamespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -458,7 +517,7 @@ export function createCornerstoneToolsCallback(
         ? await callApi("GET", path, { query: buildStewardQueryParams(input, namespace) })
         : await callApi("POST", path, { body: buildStewardRequestBody(input, namespace) });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, namespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -480,11 +539,13 @@ export function createCornerstoneToolsCallback(
         `steward_preview does not support operation \`${operation}\`. Supported: ${Object.keys(STEWARD_PREVIEW_OPERATIONS).join(", ")}`,
       );
     }
-    // Preview is a write-scope tool: namespace forced to aiops regardless of input.
-    const body = buildStewardRequestBody(input, AI_OPS_WRITE_WORKSPACE);
+    // Preview is a write-scope tool: namespace resolved from taskWorkspace
+    // (or env fallback). Agent-supplied namespace input is dropped by
+    // buildStewardRequestBody anyway since we pass writeNamespace explicitly.
+    const body = buildStewardRequestBody(input, writeNamespace);
     const res = await callApi("POST", path, { body });
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      return mapApiError(res, writeNamespace);
     }
     return { status: "ok", output: res.body };
   }
@@ -498,7 +559,10 @@ export function createCornerstoneToolsCallback(
     }
     const res = await callApi("GET", `/ops/maintenance/jobs/${encodeURIComponent(jobId)}`);
     if (!res.ok) {
-      return errorResult("cornerstone_api_error", apiErrorMessage(res.body), res);
+      // steward_status is a job-id lookup, not namespace-scoped — pass null
+      // so any 403 here surfaces as a generic api_error rather than the
+      // workspace-grant code (the API would reject for a different reason).
+      return mapApiError(res, null);
     }
     return { status: "ok", output: res.body };
   }

@@ -264,6 +264,108 @@ describe("cornerstone-tools handler — namespace scoping (security invariant)",
   });
 });
 
+describe("cornerstone-tools handler — targetWorkspace routing (per-task workspace plumbing)", () => {
+  // Helper that mirrors makeCallback() but lets the test pin a per-task
+  // targetWorkspace. The factory closure-captures this once, so a single
+  // dispatch instance models a single task's run.
+  function makeCallbackWithWorkspace(
+    handler: (call: FetchCall) => { status: number; body: unknown },
+    targetWorkspace: string | null,
+  ) {
+    const { fetchImpl, calls } = scriptedFetch(handler);
+    const dispatch = createCornerstoneToolsCallback({
+      companyId: "test-company",
+      fetchImpl,
+      apiKeyResolver: async () => "test-api-key",
+      targetWorkspace,
+    });
+    return { dispatch, calls };
+  }
+
+  it("writes route to targetWorkspace when the task sets it, ignoring agent-supplied namespace input", async () => {
+    const { dispatch, calls } = makeCallbackWithWorkspace(
+      () => ok({ ok: true }),
+      "usefulmachines",
+    );
+    await dispatch({
+      name: "add_fact",
+      input: { key: "client_thing", value: "x", namespace: "default" },
+    });
+    await dispatch({
+      name: "save_conversation",
+      input: { topic: "client review", messages: [{ role: "assistant", content: "y" }], namespace: "default" },
+    });
+    await dispatch({
+      name: "steward_preview",
+      input: { operation: "merge-duplicates", namespace: "default" },
+    });
+    expect((calls[0].body as { namespace: string }).namespace).toBe("usefulmachines");
+    expect((calls[1].body as { namespace: string }).namespace).toBe("usefulmachines");
+    expect((calls[2].body as { namespace: string }).namespace).toBe("usefulmachines");
+  });
+
+  it("reads route to targetWorkspace when the task sets it, ignoring agent-supplied namespace input (delegation safety)", async () => {
+    const { dispatch, calls } = makeCallbackWithWorkspace(() => ok({}), "usefulmachines");
+    await dispatch({ name: "get_context", input: { query: "x", namespace: "default" } });
+    await dispatch({ name: "search", input: { query: "x", namespace: "default" } });
+    await dispatch({ name: "list_facts", input: { namespace: "default" } });
+    await dispatch({ name: "recall", input: { query: "x", namespace: "default" } });
+    await dispatch({ name: "steward_inspect", input: { operation: "duplicates", namespace: "default" } });
+    expect((calls[0].body as { namespace: string }).namespace).toBe("usefulmachines");
+    expect((calls[1].body as { namespace: string }).namespace).toBe("usefulmachines");
+    expect(calls[2].query?.namespace).toBe("usefulmachines");
+    expect((calls[3].body as { namespace: string }).namespace).toBe("usefulmachines");
+    expect(calls[4].query?.namespace).toBe("usefulmachines");
+  });
+
+  it("reads honour agent-supplied namespace when the task has no targetWorkspace pinned", async () => {
+    const { dispatch, calls } = makeCallbackWithWorkspace(() => ok({}), null);
+    await dispatch({ name: "get_context", input: { query: "x", namespace: "default" } });
+    expect((calls[0].body as { namespace: string }).namespace).toBe("default");
+  });
+
+  it("writes fall through to AI_OPS_WRITE_WORKSPACE when the task has no targetWorkspace and no agent input", async () => {
+    const { dispatch, calls } = makeCallbackWithWorkspace(() => ok({ ok: true }), null);
+    await dispatch({ name: "add_fact", input: { key: "x", value: "y" } });
+    expect((calls[0].body as { namespace: string }).namespace).toBe(AI_OPS_WRITE_WORKSPACE);
+  });
+
+  it("maps 403 namespace_not_granted to structured target_workspace_grant_missing error code", async () => {
+    const { dispatch } = makeCallbackWithWorkspace(
+      () => ({ status: 403, body: { detail: "namespace_not_granted" } }),
+      "usefulmachines",
+    );
+    const res = await dispatch({ name: "add_fact", input: { key: "x", value: "y" } });
+    expect(res.status).toBe("error");
+    expect(res.errorCode).toBe("target_workspace_grant_missing");
+    expect(res.errorMessage).toContain("usefulmachines");
+  });
+
+  it("maps the multiple-grants 403 (namespace required) to target_workspace_grant_missing", async () => {
+    // The Cornerstone API also returns 403 with "Namespace is required. This
+    // principal has multiple workspace grants" — same root cause (resolved
+    // namespace is empty/unauthorised), same structured code expected.
+    const { dispatch } = makeCallbackWithWorkspace(
+      () =>
+        ({ status: 403, body: { detail: "Namespace is required. This principal has multiple workspace grants" } }),
+      null,
+    );
+    const res = await dispatch({ name: "get_context", input: { query: "x" } });
+    expect(res.status).toBe("error");
+    expect(res.errorCode).toBe("target_workspace_grant_missing");
+  });
+
+  it("does not misclassify 403s that are NOT namespace-grant failures", async () => {
+    const { dispatch } = makeCallbackWithWorkspace(
+      () => ({ status: 403, body: { detail: "rate_limited" } }),
+      "usefulmachines",
+    );
+    const res = await dispatch({ name: "add_fact", input: { key: "x", value: "y" } });
+    expect(res.status).toBe("error");
+    expect(res.errorCode).toBe("cornerstone_api_error");
+  });
+});
+
 describe("cornerstone-tools handler — steward_apply is blocked for dogfood", () => {
   it("steward_apply returns status=pending_approval and DOES NOT hit the API", async () => {
     const { dispatch, calls } = makeCallback(() => ok({ applied: true }));

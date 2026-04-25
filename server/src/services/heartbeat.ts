@@ -2089,6 +2089,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAgentId: issues.assigneeAgentId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        targetWorkspace: issues.targetWorkspace,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
@@ -4644,6 +4645,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           projectWorkspaceId: issueContext.projectWorkspaceId,
           executionWorkspaceId: issueContext.executionWorkspaceId,
           executionWorkspacePreference: issueContext.executionWorkspacePreference,
+          targetWorkspace: issueContext.targetWorkspace ?? null,
         }
       : null;
     const continuationSummary = issueRef
@@ -5353,6 +5355,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               permissions: agentPermissions,
             },
             parentRunId: run.id,
+            // Carry the parent task's Cornerstone targetWorkspace through the
+            // delegation boundary so child agents inherit the same workspace
+            // scope. This is the propagation step Mal called out as
+            // "Delegation propagates parent task's targetWorkspace through to
+            // child tasks." Children cannot opt out — agent-supplied namespace
+            // on tool calls is also ignored downstream (delegation safety,
+            // closes prompt-injection hole).
+            parentTargetWorkspace: issueRef?.targetWorkspace ?? null,
             cancelRun: (childRunId, reason) =>
               cancelRunInternal(childRunId, reason ?? "Cancelled by parent delegation timeout").then(() => undefined),
           })
@@ -5366,6 +5376,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? createCornerstoneToolsCallback({
             db,
             companyId: agent.companyId,
+            // The task's targetWorkspace overrides AI_OPS_WRITE_WORKSPACE for
+            // both reads and writes. Agent-supplied namespace on tool calls is
+            // ignored when this is set (delegation safety / prompt-injection
+            // guard). Null falls through to AI_OPS_WRITE_WORKSPACE.
+            targetWorkspace: issueRef?.targetWorkspace ?? null,
           })
         : undefined;
       // Per-run AbortController for in-process adapters (managed_agents).

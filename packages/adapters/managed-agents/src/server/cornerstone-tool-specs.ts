@@ -30,10 +30,17 @@ export function isCornerstoneToolName(name: string): name is CornerstoneToolName
 // the handler's input guards in server/src/services/cornerstone-tools.ts so
 // the model sees the same required/optional fields the handler enforces.
 //
+// Read tools (get_context, search, list_facts, recall, steward_inspect,
+// steward_advise) accept an optional `namespace` field. When the task's
+// targetWorkspace is set, the handler routes to that workspace and ignores
+// the agent-supplied namespace; when it isn't set, the agent-supplied
+// namespace is honoured (or the AI_OPS_WRITE_WORKSPACE fallback applies).
+//
 // Write tools (add_fact, save_conversation, steward_preview, steward_apply)
-// still accept `namespace` in their schema for shape parity with read tools,
-// but the handler forces namespace to `aiops` regardless — per-agent
-// attribution is carried via key prefix conventions, not namespace.
+// do NOT accept `namespace` — writes are always routed to the task's
+// targetWorkspace (or AI_OPS_WRITE_WORKSPACE fallback). This is a delegation
+// safety guarantee: an agent cannot redirect writes via tool input,
+// closing a prompt-injection vector for cross-namespace writes.
 // ---------------------------------------------------------------------------
 
 const STEWARD_INSPECT_OPERATIONS = [
@@ -85,7 +92,7 @@ function getContextSpec(): MaCustomToolSpec {
         namespace: {
           type: "string",
           description:
-            "Optional workspace to scope retrieval. Omit to search the default (aiops).",
+            "Defaults to your task's target workspace; pass namespace explicitly to override (only honoured when the task has no target workspace pinned).",
         },
         detail_level: {
           type: "string",
@@ -116,7 +123,8 @@ function searchSpec(): MaCustomToolSpec {
         },
         namespace: {
           type: "string",
-          description: "Optional workspace scope.",
+          description:
+            "Defaults to your task's target workspace; pass namespace explicitly to override (only honoured when the task has no target workspace pinned).",
         },
         detail_level: {
           type: "string",
@@ -142,7 +150,8 @@ function listFactsSpec(): MaCustomToolSpec {
       properties: {
         namespace: {
           type: "string",
-          description: "Optional workspace scope.",
+          description:
+            "Defaults to your task's target workspace; pass namespace explicitly to override (only honoured when the task has no target workspace pinned).",
         },
         key_prefix: {
           type: "string",
@@ -176,7 +185,8 @@ function recallSpec(): MaCustomToolSpec {
         },
         namespace: {
           type: "string",
-          description: "Optional workspace scope.",
+          description:
+            "Defaults to your task's target workspace; pass namespace explicitly to override (only honoured when the task has no target workspace pinned).",
         },
         detail_level: {
           type: "string",
@@ -196,7 +206,7 @@ function addFactSpec(): MaCustomToolSpec {
   return {
     name: "add_fact",
     description:
-      "Record a discrete, stable, referenceable fact to Cornerstone (always written to the aiops workspace). Facts must be atomic (one topic), objectively true or user-confirmed, and under ~200 tokens. Use descriptive key conventions (e.g. 'co_paperclip_<topic>').",
+      "Record a discrete, stable, referenceable fact to Cornerstone. Always written to your task's target workspace (or the AI_OPS_WRITE_WORKSPACE fallback if the task has no target workspace pinned); namespace cannot be overridden via tool input. Facts must be atomic (one topic), objectively true or user-confirmed, and under ~200 tokens. Use descriptive key conventions (e.g. 'co_paperclip_<topic>').",
     input_schema: {
       type: "object",
       properties: {
@@ -227,7 +237,7 @@ function saveConversationSpec(): MaCustomToolSpec {
   return {
     name: "save_conversation",
     description:
-      "Persist a business-relevant exchange (decision, debugging session, planning) to Cornerstone (always aiops). Captures the WHY behind decisions. Do not save personal/off-topic chatter. Pass descriptive `topic`, not 'conversation about stuff'.",
+      "Persist a business-relevant exchange (decision, debugging session, planning) to Cornerstone. Always written to your task's target workspace (or the AI_OPS_WRITE_WORKSPACE fallback if the task has no target workspace pinned); namespace cannot be overridden via tool input. Captures the WHY behind decisions. Do not save personal/off-topic chatter. Pass descriptive `topic`, not 'conversation about stuff'.",
     input_schema: {
       type: "object",
       properties: {
@@ -272,7 +282,8 @@ function stewardInspectSpec(): MaCustomToolSpec {
         },
         namespace: {
           type: "string",
-          description: "Optional workspace scope for the inspection.",
+          description:
+            "Defaults to your task's target workspace; pass namespace explicitly to override (only honoured when the task has no target workspace pinned).",
         },
       },
       required: ["operation"],
@@ -294,7 +305,8 @@ function stewardAdviseSpec(): MaCustomToolSpec {
         },
         namespace: {
           type: "string",
-          description: "Optional workspace scope.",
+          description:
+            "Defaults to your task's target workspace; pass namespace explicitly to override (only honoured when the task has no target workspace pinned).",
         },
         items: {
           type: "array",
@@ -335,7 +347,7 @@ function stewardPreviewSpec(): MaCustomToolSpec {
   return {
     name: "steward_preview",
     description:
-      "Dry-run a mutating steward operation against the aiops workspace. Returns the exact changes that would be applied by steward_apply, without touching memory. Safe to call; namespace is always forced to aiops. Per-operation required fields are described below — operations like delete-by-filter and rename-keys reject empty bodies (no-op delete = 400).",
+      "Dry-run a mutating steward operation. Returns the exact changes that would be applied by steward_apply, without touching memory. Always run against your task's target workspace (or the AI_OPS_WRITE_WORKSPACE fallback if the task has no target workspace pinned); namespace cannot be overridden via tool input. Per-operation required fields are described below — operations like delete-by-filter and rename-keys reject empty bodies (no-op delete = 400).",
     input_schema: {
       type: "object",
       properties: {
